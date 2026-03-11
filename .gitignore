@@ -1,0 +1,8 @@
+
+bvh_assembler/room.obj
+
+bvh_assembler/bvh_leaf_triangles.txt
+
+rust_rt_arch_sim/bvh_data/bvh_nodes.txt
+
+rust_rt_arch_sim/bvh_data/bvh_triangles.txt
