@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../assembler/rust_assembler_mimd"
+		}
+	],
+	"settings": {}
+}

@@ -1,0 +1,12 @@
+[package]
+name = "rust_rt_arch_sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam = "0.8.4"
+half = "2.7.1"
+hashbrown = "0.12"
+ndarray = "0.16"
+ndarray-npy = "0.9"
+csv = "1.3"
