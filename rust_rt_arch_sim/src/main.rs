@@ -487,12 +487,9 @@ fn dump_logs_for_viz(
 
 
 fn main() {
-    assemble_tree("bvh_data".to_string());
-    return;
+    // assemble_tree("bvh_data".to_string());
+    // return;
 
-
-
-    println!("0.0f: {}", (0.0f32).to_bits());
     let mut stacks: Vec<Stack> = assemble_stacks();
     let init_vector = get_init_vector();
     println!("Num program init bytes per core: {}", (init_vector[0] + 1)*4);

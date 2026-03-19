@@ -367,6 +367,7 @@ pub enum Operation {
     LoadHalfSigned,
     LoadHalfUnsigned,
     LoadWord,
+    AtomicAdd,
 
     // Control
     BranchEq,
@@ -394,6 +395,7 @@ pub enum Operation {
     StoreByteDram,
     AtomicAddDram,
     SendFlit,
+    GetLowClock,
 }
 #[derive(Copy, Clone)]
 enum FpType {
@@ -585,6 +587,8 @@ fn decode_instruction(instruction_word: u32, pc: u16) -> DecodedInstruction {
         48 => Operation::AtomicAddDram,
         49 => Operation::SendFlit,
         50 => Operation::Mod,
+        51 => Operation::AtomicAdd,
+        52 => Operation::GetLowClock,
         _ => panic!("UNKNOWN OPERATION"),
     };
     let fp_type = match (instruction_word >> 20) & 0x3 {
@@ -630,7 +634,7 @@ fn num_source_registers(instr: &DecodedInstruction) -> u8 {
         | ModifyInterruptEnable
         | SetCtx => 0,
         Jump | FPSetAccumulator | SetMemoryBits => 1,
-        StoreByte | StoreHalf | StoreWord => {
+        StoreByte | StoreHalf | StoreWord | AtomicAdd | Add | Sub | And | Or | Xor | Sll | Srl | Sra => {
             if instr.is_imm {
                 1
             } else {
@@ -641,17 +645,10 @@ fn num_source_registers(instr: &DecodedInstruction) -> u8 {
             if instr.is_imm { 0 } else { 1 }
         }
 
-        Add | Sub | And | Or | Xor | Sll | Srl | Sra => {
-            if instr.is_imm {
-                1
-            } else {
-                2
-            }
-        }
         Mul | Div | Mod => 2,
         FPAdd | FPMul | FPSub | FPEQ | FPLT | FPMinMax => 2,
         FPMac => 2,
-        FPStoreAccumulator => 0,
+        FPStoreAccumulator | GetLowClock => 0,
         BranchEq | BranchNe | BranchLTE | BranchGT => 2,
         BlockVal => 0,
 
@@ -2197,7 +2194,29 @@ impl Core {
 
                         self.pc[self.context_in_progress] += 4;
                     }
-
+                    Operation::AtomicAdd => {
+                        if instruction_to_execute.is_imm {
+                            let address = self.register_file
+                                [instruction_to_execute.sr1 + self.context_in_progress * REGS_PER_CONTEXT]
+                                as u32 as u16;
+                            let old_val = self.read_sram_word(&address);
+                            self.write_sram_word(old_val + instruction_to_execute.imm_0, &address);
+                            self.register_file[self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.dr] = old_val;
+                        } else {
+                            let address = self.register_file
+                                [instruction_to_execute.sr1 + self.context_in_progress * REGS_PER_CONTEXT]
+                                as u32 as u16;
+                            let old_val = self.read_sram_word(&(address as u16));
+                            let new_val = old_val + self.register_file
+                                [instruction_to_execute.sr2 + self.context_in_progress * REGS_PER_CONTEXT];
+                            if DEBUG {
+                                println!("WORD TO STORE CORE {}: 0x{:08X}/{}, cycle: {}", self.core_id, new_val, new_val as i32, self.cycle);
+                            }
+                            self.write_sram_word(new_val, &address);
+                            self.register_file[self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.dr] = old_val;
+                        }
+                        self.pc[self.context_in_progress] += 4;
+                    }
                     Operation::BranchEq => {
                         if self.register_file
                             [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
@@ -2320,7 +2339,6 @@ impl Core {
 
                         self.pc[self.context_in_progress] += 4;
                     }
-
                     Operation::Yield => {
                         switch_ctx = true;
                         if self.ctx_ownership >= 0 {
@@ -2766,11 +2784,15 @@ impl Core {
                     }
                     Operation::AtomicAddDram => {
                         let dram_address = self.register_file
-                            [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr2]
+                            [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
                             as usize
                             | (self.memory_bits[self.context_in_progress] as usize) << DRAM_STACK_SIZE_LOG2;
-                        let value_to_store = self.register_file
-                            [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1];
+                        let value_to_store = if instruction_to_execute.is_imm {
+                            instruction_to_execute.imm_0
+                        }
+                        else {
+                            self.register_file[self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr2]
+                        };
                         assert!(
                             dram_address & 0x3 == 0,
                             "DRAM Word LOADS CAN'T BE UNALIGNED"
@@ -2845,6 +2867,10 @@ impl Core {
                             self.pc[self.context_in_progress] += 4;
                         }
                     }
+                    Operation::GetLowClock => {
+                        self.register_file[self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.dr] = self.cycle as u32;
+                        self.pc[self.context_in_progress] += 4;
+                    },
                 }
             }
             else{

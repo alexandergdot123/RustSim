@@ -11,7 +11,7 @@ enum FpType {
     Fp16 = 1,
     Fp8 = 2,
 }
-
+//NEED ATOMICADD AND GETCLK
 /* ===================== ISA TABLE ===================== */
 
 fn opcode_table() -> HashMap<&'static str, u32> {
@@ -27,7 +27,7 @@ fn opcode_table() -> HashMap<&'static str, u32> {
         ("jmp", 23),
 
         ("sb", 24), ("sh", 25), ("sw", 26),
-        ("lb", 27), ("lbu", 28), ("lh", 29), ("lhu", 30), ("lw", 31),
+        ("lb", 27), ("lbu", 28), ("lh", 29), ("lhu", 30), ("lw", 31), ("atomadd", 51),
 
         ("block", 32), ("nonblock", 33),
         ("yield", 34),
@@ -41,7 +41,7 @@ fn opcode_table() -> HashMap<&'static str, u32> {
         ("lw_d", 44), ("sw_d", 45), ("sh_d", 46), ("sb_d", 47),
         ("atomadd_d", 48),
 
-        ("sendflit", 49),
+        ("sendflit", 49), ("getclk", 52),
     ])
 }
 
@@ -240,7 +240,7 @@ fn assemble_instruction(
             return instr;
         }
         23 => { // JMP
-            if args.len() != 23 { panic!("jmp expects: dr rS1|IMM16"); }
+            if args.len() != 2 { panic!("jmp expects: dr rS1|IMM16"); }
             set_dr(&mut instr, parse_reg(args[0]));
 
             if args[1].starts_with('r'){
@@ -250,6 +250,11 @@ fn assemble_instruction(
                 set_imm(&mut instr, parse_imm_or_label(args[1], labels));
                 set_imm1(&mut instr, 1);
             }
+            return instr;
+        }
+        52 => { //getclk
+            if args.len() != 1 { panic!("getclk expects: dr"); }
+            set_dr(&mut instr, parse_reg(args[0]));
             return instr;
         }
         _ => {}
@@ -266,8 +271,7 @@ fn assemble_instruction(
     let is_store_s = (24..=26).contains(&opcode);
     let is_store_d = (45..=47).contains(&opcode);
     // Atomic add DRAM: 48
-    let is_atomicadd = opcode == 48;
-
+    let is_atomicadd = opcode == 48 || opcode == 51;
     if is_load_s {
         if args.len() != 2 {
             panic!("{} expects: {} rD, rBASE OR IMM16|label", op_name, op_name);
@@ -351,19 +355,23 @@ fn assemble_instruction(
     }
 
     if is_atomicadd {
-        // format: atomadd_d rSRC, rBASE, IMM16|label
-        // encoding: sr1=value, sr2=base, imm0=offset, imm1=1
+        // atomadd_d rDest, rBase, rSrc|IMM16
         if args.len() != 3 {
-            panic!("atomadd_d expects: atomadd_d rdest, rsrc, rbase");
+            panic!("atomadd_d expects: atomadd_d rDest, rBase, rSrc|IMM16");
         }
         let dest = parse_reg(args[0]);
-        let src = parse_reg(args[1]);
-        let base = parse_reg(args[2]);
+        let base = parse_reg(args[1]);
 
         set_dr(&mut instr, dest);
-        set_sr1(&mut instr, src);
-        set_sr2(&mut instr, base);
-        set_imm1(&mut instr, 0);
+        set_sr1(&mut instr, base);
+
+        if args[2].starts_with('r') {
+            set_sr2(&mut instr, parse_reg(args[2]));
+            set_imm1(&mut instr, 0);
+        } else {
+            set_imm(&mut instr, parse_imm_or_label(args[2], labels));
+            set_imm1(&mut instr, 1);
+        }
         return instr;
     }
 
