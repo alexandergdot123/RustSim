@@ -142,27 +142,25 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
                     ray_send_pending[self.thread_id] = 0;
                     atomic_add(&total_rays_traced, 1);
                     ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
-                    if(branch_core_response >> 24 == wrong_core){
-                        queue_address_low = node->queue_low_bit_addr;
-                        queue_address_low += 20;
-                        atomic_add_dram(queue_address_low, 1);
-                        //lock_loop
-                        int lock_positive = load_dram_word(queue_address_low);
-                        if(lock_positive < 0) {
-                            goto lock_loop;
-                        }
-                        int old_queue_address = queue_address_low;
-                        queue_address_low += 4;
-                        int num_cores = load_dram_word(queue_address_low);
-                        int hash = (self.coreid >> 6) ^ self.coreid;
-                        int core_hash = hash % num_cores;
-                        core_hash = core_hash << 2;
-                        queue_address_low += 4;
-                        queue_address_low += core_hash;
-                        int cur_core = load_dram_half(queue_address_low);
-                        node->core_owner = cur_core;
-                        atomic_add(old_queue_address, -1);
+                    queue_address_low = node->queue_low_bit_addr;
+                    queue_address_low += 20;
+                    atomic_add_dram(queue_address_low, 1);
+                    //lock_loop
+                    int lock_positive = load_dram_word(queue_address_low);
+                    if(lock_positive < 0) {
+                        goto lock_loop;
                     }
+                    int old_queue_address = queue_address_low;
+                    queue_address_low += 4;
+                    int num_cores = load_dram_word(queue_address_low);
+                    int hash = (self.coreid >> 6) ^ self.coreid;
+                    int core_hash = hash % num_cores;
+                    core_hash = core_hash << 2;
+                    queue_address_low += 4;
+                    queue_address_low += core_hash;
+                    int cur_core = load_dram_half(queue_address_low);
+                    node->core_owner = cur_core;
+                    atomic_add(old_queue_address, -1);
                     goto ray_done;
                 }
                 for(int i = 0; i < 16; i++){
