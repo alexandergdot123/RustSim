@@ -31,22 +31,21 @@ typedef struct {
     float luminance;      // 4 bytes  - emissive
 } Vertex;                 // 28 bytes total
 
-typedef struct { //73 Bytes, 18 packets
+typedef struct { //64 Bytes, 16 packets
     float ox, oy, oz;      // 12 bytes - origin
     float dx, dy, dz;      // 12 bytes - direction
     float inv_dx, inv_dy, inv_dz; // 12 bytes - precomputed 1/direction
     float t_min, t_max;    // 8 bytes  - valid interval
     uint32_t check_left;   // used for backtracking
     uint32_t check_right;  // used for backtracking
+    uint16_t pix_x;
+    uint16_t pix_y;
+    uint32_t tri_index;     // index of the triangle hit, 0xFFFF_FFFF if no hit
     uint8_t bounce_count;
     uint8_t ray_depth;    
     uint8_t light_id; //msb = is_shadow
-    uint16_t pix_x;
-    uint16_t pix_y;
-    float u, v;
-    uint32_t tri_index;     // index of the triangle hit, 0xFFFF_FFFF if no hit
     uint8_t active_ray;
-} Ray;                    // 73 bytes total (right now)
+} Ray;                    //64 Bytes, 16 packets
 
 typedef struct {
     uint32_t data_mailbox[16]; //deep
@@ -62,6 +61,16 @@ typedef struct { //4112 Bytes
     uint32_t core_owner;
     struct Ray[256] rays; //256 * 76 bytes for the rays
 } ray_queue_dram;
+
+//ideally, there are 22 levels of nodes. 
+//branch cores own 9 local levels of nodes = 512 nodes = 24.5KB.
+//Additionally, they cache another 6 levels of nodes above themselves to allow leaf-leaf forwarding.
+//6 levels = 64 nodes = 3KB
+//Branch cores own 7 levels of nodes above their owned leaf cores's roots. 
+//7 levels = 128 nodes = 6KB
+//Additionally, they will own the final tree above their root so that they can get 9 + 7 + 6 = 22 fully live nodes
+//All of these top 6 levels will be shared between all branch cores
+//6 levels = 64 nodes = 3KB
 
 const core_ray_forward = 5;
 const branch_trade_rays = 6;
@@ -93,82 +102,64 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
     //every time we do an intersection, we mark the current depth with a 1 on the correct side
     //every time we move up the tree, we mark all nodes below that level with 0
     if(hit){
-        if(node->tri_count == 0){
-            ray->ray_depth++;
-            if(node->core_owner != 0xFFFF){
-                //finish
-                ray_send_pending[self.thread_id] = 1;
-                send_packet(self.thread_id, node->core_owner, 48);
-                send_packet(node->node_id, node->core_owner, 48);
-                //forward_branch_ray_loop
-                int got_response = non_blocking_receive(16 + self.thread_id);
-                if(got_response == 1){
-                    int branch_core_response = blocking_receive(16 + self.thread_id);
-                    if(branch_core_response >> 24 == reject_ray || branch_core_response >> 24 == wrong_core){
-                        int queue_address_low = node->queue_low_bit_addr;
-                        int queue_address_high = node->queue_high_bit_addr;
-                        set_address_bits(queue_address_high);
-                        node->core_owner = load_dram_word(queue_address_low + 12);
+        ray->ray_depth++;
+        if(node->core_owner != 0xFFFF){
+            //finish
+            ray_send_pending[self.thread_id] = 1;
+            send_packet(self.thread_id, node->core_owner, 48);
+            send_packet(node->node_id, node->core_owner, 48);
+            //forward_branch_ray_loop
+            int got_response = non_blocking_receive(16 + self.thread_id);
+            if(got_response == 1){
+                int branch_core_response = blocking_receive(16 + self.thread_id);
+                if(branch_core_response >> 24 == reject_ray || branch_core_response >> 24 == wrong_core){
+                    int queue_address_low = node->queue_low_bit_addr;
+                    int queue_address_high = node->queue_high_bit_addr;
+                    set_address_bits(queue_address_high);
+                    node->core_owner = load_dram_word(queue_address_low + 12);
 
-                        //ensure_space_in_queue:
-                        int cur_ray_count = load_dram_word(queue_address_low + 8);
-                        if(cur_ray_count >= 200){ //if the queue is full, wait until there is space
-                            goto ensure_space_in_queue;
-                        }
+                    //ensure_space_in_queue:
+                    int cur_ray_count = load_dram_word(queue_address_low + 8);
+                    if(cur_ray_count >= 200){ //if the queue is full, wait until there is space
+                        goto ensure_space_in_queue;
+                    }
 
-                        int tail = atomic_add_dram(queue_address_low + 4, 76); //add a ray to the queue
-                        atomic_add_dram(queue_address_low + 8, 1); //increment the count of rays in the queue
-                        tail = tail % 256 * 76; //64 bytes, 256 slots in queue
-                        queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
-                        queue_address_low = queue_address_low + tail;
-                        int ray_index = ray;
-                        for(int i = 0; i < 18; i += 1){
-                            store_dram_word(queue_address_low, ray_index);
-                            int queue_address_low = queue_address_low + 4;
-                            ray_index = ray_index + 4;
-                        }
-                        store_dram_word(queue_address_low, 1); //mark the ray as valid
-                        ray_send_pending[self.thread_id] = 0;
-                        atomic_add(&total_rays_traced, 1);
-                        ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
-                        goto ray_done;
-                    }
-                    for(int i = 0; i < 18; i++){
-                        send_packet(((uint32_t*)ray)[i], node->core_owner, self.thread_id);
-                    }
-                    if(branch_core_response >> 24 == trade_rays){
-                        for(int i = 0; i < 18; i++){
-                            ((uint32_t*)ray)[i] = blocking_receive(self.thread_id);
-                        }
-                    }
-                    else{
-                        ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
+                    int tail = atomic_add_dram(queue_address_low + 4, 64); //add a ray to the queue
+                    atomic_add_dram(queue_address_low + 8, 1); //increment the count of rays in the queue
+                    tail = tail & 0x00003FFF; //64 bytes, 256 slots in queue
+                    queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
+                    queue_address_low = queue_address_low + tail;
+                    int ray_index = ray;
+                    for(int i = 0; i < 16; i += 1){
+                        store_dram_word(queue_address_low, ray_index);
+                        int queue_address_low = queue_address_low + 4;
+                        ray_index = ray_index + 4;
                     }
                     ray_send_pending[self.thread_id] = 0;
                     atomic_add(&total_rays_traced, 1);
+                    ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
                     goto ray_done;
                 }
-                yield(); // I am going to need to be extremely careful about designing my interrupts
-                goto forward_branch_ray_loop;
+                for(int i = 0; i < 16; i++){
+                    send_packet(((uint32_t*)ray)[i], node->core_owner, self.thread_id);
+                }
+                if(branch_core_response >> 24 == trade_rays){
+                    for(int i = 0; i < 16; i++){
+                        ((uint32_t*)ray)[i] = blocking_receive(self.thread_id);
+                    }
+                }
+                else{
+                    ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
+                }
+                ray_send_pending[self.thread_id] = 0;
+                atomic_add(&total_rays_traced, 1);
+                goto ray_done;
             }
-            else{
-                node = node->left_child; // Traverse left child first
-            }
+            yield(); // I am going to need to be extremely careful about designing my interrupts
+            goto forward_branch_ray_loop;
         }
         else{
-            // We've hit a leaf node, so we need to check for intersections with the triangles
-            uint32_t bitfield = *(ray.check_left + node->is_right * 4);
-            uint32_t or_value = 1 << (ray->ray_depth - 1);
-            bitfield |= or_value;
-            *(ray.check_left + node->is_right * 4) = bitfield;
-            uint16_t tri_index = node->tri_start;
-            for(int i = 0; i < node->tri_count; i++){
-                Triangle_Intersect(tri_index, ray);
-                tri_index = tri_index + 12;
-            }
-            // After checking all triangles, we can backtrack
-            ray->ray_depth--;
-            node = node->parent;
+            node = node->left_child; // Traverse left child first
         }
     }
     else{
@@ -194,43 +185,40 @@ goto start_searching
 if(ray->active_ray == 1){
     goto start_ray_traversal;
 }
-while(1){
-    yield();
-    int queue_address_low = self.ray_queue_address_low;
-    int queue_address_high = self.ray_queue_address_high;
-    set_address_bits(queue_address_high);
-    int cur_ray_count = load_dram_word(queue_address_low + 8); //check if there are any rays in the queue
-    if(cur_ray_count > 0){
-        int cur_ray_count_check = atomic_add_dram(queue_address_low + 8, -1); //decrement the count of rays in the queue
-        if(cur_ray_count_check == 0){ //if another core took the last ray, we should check again
-            atomic_add_dram(queue_address_low + 8, 1); //undo the decrement
-            goto ray_done;
-        }
-        int head = atomic_add_dram(queue_address_low, 76); // advance head atomically first
-        queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
-        head = (head % 256 * 76);
-        queue_address_low = queue_address_low + head;
-        //wait_for_write
-        int ready = load_dram_word(queue_address_low + 72); //the last 4 bytes of the ray slot are used to indicate if the ray is ready to be read
-        if(ready == 0){
-            goto wait_for_write;
-        }
-        int ray_index = ray;
-        for(int i = 0; i < 18; i++){
-            *(ray_index) = load_dram_word(queue_address_low);
-            queue_address_low = queue_address_low + 4;
-            ray_index = ray_index + 4;
-        }
-        write_dram_word(queue_address_low, 0); //mark the ray as consumed
-        queue_address_low = self.ray_queue_address_low;
-        ray->active_ray = 1; //mark the ray as active
-        goto start_ray_traversal;
+yield();
+int queue_address_low = self.ray_queue_address_low;
+int queue_address_high = self.ray_queue_address_high;
+set_address_bits(queue_address_high);
+int cur_ray_count = load_dram_word(queue_address_low + 8); //check if there are any rays in the queue
+if(cur_ray_count > 0){
+    int cur_ray_count_check = atomic_add_dram(queue_address_low + 8, -1); //decrement the count of rays in the queue
+    if(cur_ray_count_check == 0){ //if another core took the last ray, we should check again
+        atomic_add_dram(queue_address_low + 8, 1); //undo the decrement
+        goto ray_done;
     }
-    yield();
-    yield();
-    yield();
-    yield();
+    int head = atomic_add_dram(queue_address_low, 64); // advance head atomically first
+    queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
+    head = head & 0x00003FFF;
+    queue_address_low = queue_address_low + head;
+    //wait_for_write
+    int ready = load_dram_byte(queue_address_low + 63); //the last 4 bytes of the ray slot are used to indicate if the ray is ready to be read
+    if(ready == 0){
+        goto wait_for_write;
+    }
+    int ray_index = ray;
+    for(int i = 0; i < 16; i++){
+        *(ray_index) = load_dram_word(queue_address_low);
+        queue_address_low = queue_address_low + 4;
+        ray_index = ray_index + 4;
+    }
+    write_dram_byte(queue_address_low - 1, 0); //mark the ray as consumed
+    queue_address_low = self.ray_queue_address_low;
+    ray->active_ray = 1; //mark the ray as active
+    goto start_ray_traversal;
 }
+//there needs to be a way to create new rays if there are none to be pulled
+
+goto ray_done //this should only be important once all computation has basically finished
 
 int AABB_Intersect(AABB_Node* node, Ray* ray) {
     float tx1 = (node->x_min - ray->ox) * ray->inv_dx;
