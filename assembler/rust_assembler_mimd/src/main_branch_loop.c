@@ -43,11 +43,15 @@ typedef struct {
 } mailbox_system;
 
 
-typedef struct { //4112 Bytes
+typedef struct { //16924 Bytes
     uint32_t head_relative; //relative to the start of the queue in DRAM
     uint32_t tail_relative; //relative to the start of the queue in DRAM
     uint32_t count;
-    uint32_t core_owner;
+    uint32_t next_ticket;//atomically incremented
+    uint32_t now_serving; //spin on when this value equals your ticket, then increment when done
+    uint32_t lock;
+    uint32_t core_owner_count;
+    uint16_t core_slots[256];
     struct Ray[256] rays; //256 * 64 bytes for the rays
 } ray_queue_dram;
 
@@ -114,13 +118,15 @@ typedef struct {
 } Framebuffer;
 
 typedef struct {
-    uint32_t tile_counts[1920 * 1080 / 64]; // 128KB
-} tile_atomics;
+    uint32_t index;
+    uint16_t count;
+    uint16_t is_valid;
+} tile_slot;
 
 typedef struct {
     uint32_t head;
     uint32_t tail;
-    uint32_t tiles_avail[2^15]; // slightly larger than 1920*1080/64 + 1. Also initializes to full.
+    struct tile_slot slots[1 << 15]; // slightly larger than 1920*1080/64 + 1. Also initializes to full.
 } tile_queue;
 
 

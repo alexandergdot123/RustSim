@@ -54,12 +54,16 @@ typedef struct {
     uint32_t interrupt_mailbox[16];
 } mailbox_system;
 
-typedef struct { //4112 Bytes
+typedef struct { //16924 Bytes
     uint32_t head_relative; //relative to the start of the queue in DRAM
     uint32_t tail_relative; //relative to the start of the queue in DRAM
     uint32_t count;
-    uint32_t core_owner;
-    struct Ray[256] rays; //256 * 76 bytes for the rays
+    uint32_t next_ticket;//atomically incremented
+    uint32_t now_serving; //spin on when this value equals your ticket, then increment when done
+    uint32_t lock;
+    uint32_t core_owner_count;
+    uint16_t core_slots[256];
+    struct Ray[256] rays; //256 * 64 bytes for the rays
 } ray_queue_dram;
 
 //ideally, there are 22 levels of nodes. 
@@ -127,7 +131,7 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
                     int tail = atomic_add_dram(queue_address_low + 4, 64); //add a ray to the queue
                     atomic_add_dram(queue_address_low + 8, 1); //increment the count of rays in the queue
                     tail = tail & 0x00003FFF; //64 bytes, 256 slots in queue
-                    queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
+                    queue_address_low = queue_address_low + 536; //skip the head and count, which are the first 8 bytes of the queue structure
                     queue_address_low = queue_address_low + tail;
                     int ray_index = ray;
                     for(int i = 0; i < 16; i += 1){
@@ -138,6 +142,27 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
                     ray_send_pending[self.thread_id] = 0;
                     atomic_add(&total_rays_traced, 1);
                     ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
+                    if(branch_core_response >> 24 == wrong_core){
+                        queue_address_low = node->queue_low_bit_addr;
+                        queue_address_low += 20;
+                        atomic_add_dram(queue_address_low, 1);
+                        //lock_loop
+                        int lock_positive = load_dram_word(queue_address_low);
+                        if(lock_positive < 0) {
+                            goto lock_loop;
+                        }
+                        int old_queue_address = queue_address_low;
+                        queue_address_low += 4;
+                        int num_cores = load_dram_word(queue_address_low);
+                        int hash = (self.coreid >> 6) ^ self.coreid;
+                        int core_hash = hash % num_cores;
+                        core_hash = core_hash << 2;
+                        queue_address_low += 4;
+                        queue_address_low += core_hash;
+                        int cur_core = load_dram_half(queue_address_low);
+                        node->core_owner = cur_core;
+                        atomic_add(old_queue_address, -1);
+                    }
                     goto ray_done;
                 }
                 for(int i = 0; i < 16; i++){
