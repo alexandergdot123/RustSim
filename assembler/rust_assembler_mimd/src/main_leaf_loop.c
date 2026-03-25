@@ -67,7 +67,7 @@ typedef struct { //16924 Bytes
 } ray_queue_dram;
 
 //ideally, there are 22 levels of nodes. 
-//branch cores own 9 local levels of nodes = 512 nodes = 24.5KB.
+//leaf cores own 9 local levels of nodes = 512 nodes = 24.5KB.
 //Additionally, they cache another 6 levels of nodes above themselves to allow leaf-leaf forwarding.
 //6 levels = 64 nodes = 3KB
 //Branch cores own 7 levels of nodes above their owned leaf cores's roots. 
