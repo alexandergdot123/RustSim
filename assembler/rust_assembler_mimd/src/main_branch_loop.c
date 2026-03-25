@@ -29,7 +29,7 @@ typedef struct { //64 Bytes, 16 packets
     uint32_t tri_index;     // index of the triangle hit, 0xFFFF_FFFF if no hit
     uint8_t bounce_count;
     uint8_t ray_depth;    
-    uint8_t light_id; //msb = is_shadow
+    uint8_t light_id; //0 for not a shadow, 1, 2, 3 for lights
     uint8_t active_ray;
 } Ray;                    //64 Bytes, 16 packets
 
@@ -82,15 +82,12 @@ typedef struct { //64*32 Bytes = 2052 total bytes
 // Single ray result after traversal + shading
 // Stored in fp16, accumulated in fp32 during final pass
 typedef struct {  // 16 bytes
-    uint8_t  flags;        // [4:0]=depth, [5]=hit, [6]=is_shadow, [7]=occluded
-    uint8_t  pad[3];
-    uint16_t color_r;      // fp16 - direct light contribution (shadow rays only)
-    uint16_t color_g;
-    uint16_t color_b;
-    uint16_t weight_r;     // fp16 - bounce attenuation (bounce rays only)
-    uint16_t weight_g;
-    uint16_t weight_b;
-} RayResult;  // 16 bytes
+    float r, g, b;
+    union {
+        float len_sq;
+        uint32_t tri_index;
+    };
+} RayResult;
 
 typedef struct {  // 256 bytes
     // results[depth * 4 + 0] = bounce
@@ -100,6 +97,11 @@ typedef struct {  // 256 bytes
     RayResult results[16];
 } PixelResults;
 
+typedef struct {
+    float red, green, blue;
+    float roughness, metallic;
+    float x_norm, y_norm, z_norm;
+} Triangle;                       
 // Full framebuffer of ray results for 4K
 // Address: base + (y * 3840 + x) * 256
 // Total: 3840 * 2160 * 256 = ~2.03 GB
@@ -129,8 +131,14 @@ typedef struct {
     struct tile_slot slots[1 << 15]; // slightly larger than 1920*1080/64 + 1. Also initializes to full.
 } tile_queue;
 
+typedef struct {
+    float r, g, b; 
+    float x, y, z;
+} light;
 
-
+typedef struct {
+    light[3];
+} light_array;
 
 const core_ray_forward = 5;
 const branch_trade_rays = 6;
@@ -146,6 +154,9 @@ const wrong_core = 8;
 node = self.root->left_child; // Start with the left child
 //start_searching
 yield();
+if (ray->check_left & 1 != 0 && ray->check_right & 1 != 0){
+    jmp complete_ray;
+}
 uint32_t left_bitfield_check = ray->check_left & (1 << ray->ray_depth) | node->left_child == 0;
 uint32_t right_bitfield_check = ray->check_right & (1 << ray->ray_depth) | node->right_child == 0;
 if(left_bitfield_check != 0 && right_bitfield_check != 0){
@@ -285,6 +296,11 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
     }
     else{
         // No intersection with the AABB, so we can backtrack
+        if(ray->ray_depth == 0){
+            ray->check_right = 0xFFFFFFFF;
+            ray->check_left = 0xFFFFFFFF;
+            goto start_searching;
+        }
         uint32_t right_bitfield = *(ray.check_left + node->is_right * 4);
         uint32_t or_value = 1 << (ray->ray_depth - 1);
         right_bitfield |= or_value;
@@ -301,7 +317,7 @@ else{
     node = *(node.left_child + ((left_bitfield_check != 0) * 2));
     ray->ray_depth++;
 }
-goto start_searching
+goto start_searching;
 // ray_done
 if(ray->active_ray == 1){
     goto start_ray_traversal;
@@ -373,34 +389,121 @@ int AABB_Intersect(AABB_Node* node, Ray* ray) {
     return (tmin <= tmax) & (0.0 < tmax);
 }
 
+//complete_ray
+uint32_t result_addr_high = self.ray_result_addr_high;
+uint32_t result_addr_low = self.ray_result_addr_low;
+uint32_t pix_index = ray->pix_y;
+pix_index *= 1440;
+pix_index += ray->pix_x;
+pix_index <<= 8;
+result_addr_low += pix_index;
+uint32_t bounce = ray->bounce_count;
+bounce <<= 6;
+result_addr_low += bounce;
 
 
-
-
-
-
-
-
-// Inputs available:
-//   Ray ray           - the ray that just finished traversal
-//   float randoms[4]  - pre-sampled from DRAM table via hash(pix, depth)
-//   TriData tri       - triangle verts + normal + material from tri_index lookup
-
-// Outputs:
-//   RayResult result  - written to DRAM
-//   Ray shadow_ray    - maybe pushed to queue
-//   Ray bounce_ray    - maybe pushed to queue
-//   bool has_shadow, has_bounce
-
-void process_hit(Ray ray, float randoms[4], TriData tri,
-                 RayResult *result, 
-                 Ray *shadow_ray, bool *has_shadow,
-                 Ray *bounce_ray, bool *has_bounce) 
-{
-//If it is a shadow, just write the result to the right place
-//If it is not, then if bounce = 3, only write 2 shadows to the "to be incremented" location, keep 3rd shadow local
-//If bounce != 3 and is not a shadow, then spawn 3 shadows and keep the next generated bounce local.
-//Writing to the correct place should be easy/logical.
-//Need 2 random f32 numbers per generated ray, indexable by [bounce, x, y]
-//keep up to 2 rays local per thread in leaves btw, easier to keep backups/send stuff to
+if(ray->light_id != 0) {
+    goto shadow_ray;
 }
+
+uint32_t tri_addr_high = self.triangle_address_high;
+set_address_bits(tri_addr_high);
+uint32_t tri_addr_low = self.triangle_address_low;
+uint32_t tri_offset = ray->tri_index << 5;  // * 32 bytes
+tri_addr_low += tri_offset;
+float tri_red = load_dram_word(tri_addr_low);
+float tri_green = load_dram_word(tri_addr_low + 4);
+float tri_blue = load_dram_word(tri_addr_low + 8);
+float norm_x = load_dram_word(tri_addr_low + 20);
+float norm_y = load_dram_word(tri_addr_low + 24);
+float norm_z = load_dram_word(tri_addr_low + 28);
+set_address_bits(result_addr_high);
+store_dram_word(result_addr_low,      tri_red);
+store_dram_word(result_addr_low + 4,  tri_green);
+store_dram_word(result_addr_low + 8,  tri_blue);
+//tri_red, _green, _blue unnecessary here now
+float hit_x = ray->ox + ray->t_max * ray->dx;
+float hit_y = ray->oy + ray->t_max * ray->dy;
+float hit_z = ray->oz + ray->t_max * ray->dz;
+
+
+// light 0 → slot 1
+uint16_t light = self.light_array;
+float lx = *(light) - hit_x;
+float ly = *(light + 4) - hit_y;
+float lz = *(light + 8) - hit_z;
+float ndotl = norm_x * lx + norm_y * ly + norm_z * lz;
+ndotl = max(ndotl, 0.0);
+store_dram_word(result_addr_low + 28, ndotl);
+
+// light 1 → slot 2
+lx = self.lights[1].x - hit_x;
+ly = self.lights[1].y - hit_y;
+lz = self.lights[1].z - hit_z;
+ndotl = norm_x * lx + norm_y * ly + norm_z * lz;
+ndotl = max(ndotl, 0.0);
+store_dram_word(result_addr_low + 44, ndotl);
+
+// light 2 → slot 3
+lx = self.lights[2].x - hit_x;
+ly = self.lights[2].y - hit_y;
+lz = self.lights[2].z - hit_z;
+ndotl = norm_x * lx + norm_y * ly + norm_z * lz;
+ndotl = max(ndotl, 0.0);
+store_dram_word(result_addr_low + 60, ndotl);
+
+
+//need to spawn bounce rays here:
+
+
+
+
+
+
+
+goto ray_done;
+
+
+
+// shadow_ray
+set_address_bits(result_addr_high);
+uint32_t shadow = ray->light_id;
+result_addr_low += shadow << 4;
+
+if(ray->tri_index != 0xFFFFFFFF){
+    uint32_t one = 0x3F800000;
+    store_dram_word(one, result_addr_low + 12);
+    ray->active_ray = 0;
+    goto ray_done;
+}
+
+shadow -= 1;
+uint16_t light = self.light_array;
+shadow *= 24;
+light += shadow;
+float light_r = *(light);
+float light_g = *(light + 4);
+float light_b = *(light + 8);
+float ndotl = load_dram_word(result_addr_low + 12);
+light_r *= ndotl;
+light_g *= ndotl;
+light_b *= ndotl;
+store_dram_word(light_r, result_addr_low);
+store_dram_word(light_g, result_addr_low + 4);
+store_dram_word(light_b, result_addr_low + 8);
+float light_x = *(light + 12);
+float light_y = *(light + 16);
+float light_z = *(light + 20);
+light_x -= ray->ox;
+light_y -= ray->oy;
+light_z -= ray->oz;
+light_x *= light_x;
+light_y *= light_y;
+light_z *= light_z;
+light_x += light_y;
+light_x += light_z;
+store_dram_word(light_x, result_addr_low + 12);
+ray->active_ray = 0;
+goto ray_done;
+
+
