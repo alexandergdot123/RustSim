@@ -61,7 +61,7 @@ typedef struct { //32 Bytes, 8 packets
     uint16_t pix_x; //2 bytes
     uint16_t pix_y; //2 bytes
     uint8_t bounce_count;
-    uint8_t light_id; //msb = is_shadow
+    uint8_t light_id; 
     uint8_t padding;
     uint8_t open_slot;
 } RaySpawn;                    //32 Bytes, 8 packets
@@ -72,12 +72,6 @@ typedef struct {
     uint32_t count;
     struct RaySpawn newRays[262144]; //num_cores (8192) * num_threads (16) * max_rays_per_pix (16) / num_stacks (1 per stack) (8)
 } SpawnedRayPool; //67MB across DRAM total for each stack
-
-typedef struct { //64*32 Bytes = 2052 total bytes
-    uint16_t head;
-    uint16_t tail;
-    struct RaySpawn rays[64];
-} RaySpawnArray;
 
 // Single ray result after traversal + shading
 // Stored in fp16, accumulated in fp32 during final pass
@@ -139,6 +133,12 @@ typedef struct {
 typedef struct {
     light[3];
 } light_array;
+
+typedef struct {
+    uint32_t relative_byte_cnt;
+    uint32_t random_vals[65536];
+}
+
 
 const core_ray_forward = 5;
 const branch_trade_rays = 6;
@@ -390,6 +390,7 @@ int AABB_Intersect(AABB_Node* node, Ray* ray) {
 }
 
 //complete_ray
+
 uint32_t result_addr_high = self.ray_result_addr_high;
 uint32_t result_addr_low = self.ray_result_addr_low;
 uint32_t pix_index = ray->pix_y;
@@ -405,6 +406,15 @@ result_addr_low += bounce;
 if(ray->light_id != 0) {
     goto shadow_ray;
 }
+if(ray->tri_index == 0xFFFFFFFF){
+    uint32_t zero = 0;
+    ray->active_ray = zero;
+    goto ray_done
+}
+float old_tmax = ray->t_max;
+float one_minus_epsilon = 0.99999;
+old_tmax *= one_minus_epsilon;
+ray->t_max = old_tmax;
 
 uint32_t tri_addr_high = self.triangle_address_high;
 set_address_bits(tri_addr_high);
@@ -414,6 +424,7 @@ tri_addr_low += tri_offset;
 float tri_red = load_dram_word(tri_addr_low);
 float tri_green = load_dram_word(tri_addr_low + 4);
 float tri_blue = load_dram_word(tri_addr_low + 8);
+float tri_metallic = load_dram_word(tri_addr_low + 16);
 float norm_x = load_dram_word(tri_addr_low + 20);
 float norm_y = load_dram_word(tri_addr_low + 24);
 float norm_z = load_dram_word(tri_addr_low + 28);
@@ -421,7 +432,7 @@ set_address_bits(result_addr_high);
 store_dram_word(result_addr_low,      tri_red);
 store_dram_word(result_addr_low + 4,  tri_green);
 store_dram_word(result_addr_low + 8,  tri_blue);
-//tri_red, _green, _blue unnecessary here now
+store_dram_word(result_addr_low + 12,  tri_metallic);
 float hit_x = ray->ox + ray->t_max * ray->dx;
 float hit_y = ray->oy + ray->t_max * ray->dy;
 float hit_z = ray->oz + ray->t_max * ray->dz;
@@ -453,13 +464,175 @@ ndotl = max(ndotl, 0.0);
 store_dram_word(result_addr_low + 60, ndotl);
 
 
-//need to spawn bounce rays here:
+//need to spawn shadow rays here:
+uint32_t new_ray_pool_high = self.new_ray_pool_high;
+set_address_bits(new_ray_pool_high);
+uint32_t new_ray_pool_low = self.new_ray_pool_low;
+//ensure_space_ray_pool
+uint32_t cur_num_new_rays = load_dram_word(new_ray_pool_low + 8);
+if(cur_num_new_rays > 260000){
+    goto ensure_space_ray_pool;
+}
+new_ray_pool_low += 4;
+atomic_add_dram(new_ray_pool_low, 96)
+new_ray_pool_low += 4;
+uint32_t tail_slot = atomic_add_dram(new_ray_pool_low, 96);
+new_ray_pool_low += 4;
+new_ray_pool_low += tail_slot;
+
+//spawn shadow rays
+// hit_x, hit_y, hit_z still in registers
+
+// shadow ray 0 (light 1)
+uint16_t light = self.light_array;
+float sdx = *(light + 12) - hit_x;
+float sdy = *(light + 16) - hit_y;
+float sdz = *(light + 20) - hit_z;
+
+//ensure_empty
+uint8_t is_empty = load_dram_byte(new_ray_pool_low + 31);
+if(!is_empty){
+    goto ensure_empty;
+}
+uint32_t one = 1;
+store_dram_word(new_ray_pool_low,      hit_x);
+store_dram_word(new_ray_pool_low + 4,  hit_y);
+store_dram_word(new_ray_pool_low + 8,  hit_z);
+store_dram_word(new_ray_pool_low + 12, sdx);
+store_dram_word(new_ray_pool_low + 16, sdy);
+store_dram_word(new_ray_pool_low + 20, sdz);
+uint32_t pix_xy = ray->pix_x;          // pix_x is lower 16, pix_y upper 16
+pix_xy |= (ray->pix_y << 16);
+store_dram_word(new_ray_pool_low + 24, pix_xy);
+uint32_t meta = ray->bounce_count;
+meta |= 1;                      
+store_dram_word(new_ray_pool_low + 28, meta);
+store_dram_byte(new_ray_pool_low + 31, one);
 
 
+// shadow ray 1 (light 2)
+//ensure_empty
+uint8_t is_empty = load_dram_byte(new_ray_pool_low + 63);
+if(!is_empty){
+    goto ensure_empty;
+}
+sdx = *(light + 36) - hit_x;
+sdy = *(light + 40) - hit_y;
+sdz = *(light + 44) - hit_z;
+store_dram_word(new_ray_pool_low + 32, hit_x);
+store_dram_word(new_ray_pool_low + 36, hit_y);
+store_dram_word(new_ray_pool_low + 40, hit_z);
+store_dram_word(new_ray_pool_low + 44, sdx);
+store_dram_word(new_ray_pool_low + 48, sdy);
+store_dram_word(new_ray_pool_low + 52, sdz);
+store_dram_word(new_ray_pool_low + 56, pix_xy);
+meta = ray->bounce_count;
+meta |= 2;                      // light_id = 2
+store_dram_word(new_ray_pool_low + 60, meta);
+store_dram_byte(new_ray_pool_low + 63, one);
 
+// shadow ray 2 (light 3)
+//ensure_empty
+uint8_t is_empty = load_dram_byte(new_ray_pool_low + 63);
+if(!is_empty){
+    goto ensure_empty;
+}
+sdx = *(light + 60) - hit_x;
+sdy = *(light + 64) - hit_y;
+sdz = *(light + 68) - hit_z;
+store_dram_word(new_ray_pool_low + 64, hit_x);
+store_dram_word(new_ray_pool_low + 68, hit_y);
+store_dram_word(new_ray_pool_low + 72, hit_z);
+store_dram_word(new_ray_pool_low + 76, sdx);
+store_dram_word(new_ray_pool_low + 80, sdy);
+store_dram_word(new_ray_pool_low + 84, sdz);
+store_dram_word(new_ray_pool_low + 88, pix_xy);
+meta = ray->bounce_count;
+meta |= 3;                      // light_id = 3
+store_dram_word(new_ray_pool_low + 92, meta);
+store_dram_byte(new_ray_pool_low + 95, one);
+ray->active_ray = 0;
 
+if(ray->bounce_count > 2) {
+    goto ray_done;
+}
+uint32_t random_table_high = self.random_table_addr_high;
+set_address_bits(random_table_high);
+uint32_t random_table_low = self.random_table_addr_low;
+uint32_t index = atomic_add_dram(random_table_low, 12);
+uint32_t mask = 0x0003FFFC;
+index &= mask;
+random_table_low += index;
+random_table_low += 4;
+float random1 = load_dram_word(random_table_low);
+float random2 = load_dram_word(random_table_low + 4);
+float random3 = load_dram_word(random_table_low + 8);
+uint32_t or_mask = 0x3F800000;
+uint32_t and_mask = 0x3FFFFFFF;
+random1 &= and_mask;
+random1 |= or_mask;
 
+random2 &= and_mask;
+random2 |= or_mask;
 
+random3 &= and_mask;
+random3 |= or_mask;
+
+uint32_t one_point_five = 1.5f;
+random1 -= one_point_five;
+random2 -= one_point_five;
+random3 -= one_point_five;
+uint8_t bounce = ray->bounce_count;
+bounce += 1;
+ray->bounce_count = bounce;
+uint8_t zero = 0;
+ray->ray_depth = zero;
+ray->check_left = zero;
+ray->check_right = zero
+ray->t_min = zero;
+zero |= 0xFFFFFFFF;
+uint32_t high_triangle = self.triangle_array_high;
+uint32_t low_triangle = self.triangle_array_low;
+set_address_bits(high_triangle);
+uint32_t tri_index = ray->tri_index;
+tri_index <<= 5;
+low_triangle += tri_index;
+float roughness = load_dram_word(low_triangle + 12);
+float norm_x = load_dram_word(low_triangle + 20);
+float norm_y = load_dram_word(low_triangle + 24);
+float norm_z = load_dram_word(low_triangle + 28);
+ray->tri_index = zero;
+float hit_x = ray->ox + ray->t_max * ray->dx;
+float hit_y = ray->oy + ray->t_max * ray->dy;
+float hit_z = ray->oz + ray->t_max * ray->dz;
+ray->ox = hit_x;
+ray->oy = hit_y;
+ray->oz = hit_z;
+float dot_dn = ray->dx * norm_x + ray->dy * norm_y + ray->dz * norm_z;
+dot_dn += dot_dn;  // 2 * dot(d, n)
+
+ray->dx = ray->dx - dot_dn * norm_x;
+ray->dy = ray->dy - dot_dn * norm_y;
+ray->dz = ray->dz - dot_dn * norm_z;
+random1 *= roughness;
+random2 *= roughness;
+random3 *= roughness;
+ray->dx += random1;
+ray->dy += random2;
+ray->dz += random3;
+float check = ray->dx * norm_x + ray->dy * norm_y + ray->dz * norm_z;
+if (check < 0.0) {
+    check += check;  // 2 * check
+    ray->dx -= check * norm_x;
+    ray->dy -= check * norm_y;
+    ray->dz -= check * norm_z;
+}
+float float_max = 0x7F7FFFFF;
+ray->t_max = float_max;
+//still need to do divison for inflation here
+ray->inv_dx = reciprocal(ray->dx);
+ray->inv_dy = reciprocal(ray->dy);
+ray->inv_dz = reciprocal(ray->dz);
 
 goto ray_done;
 
@@ -507,3 +680,47 @@ ray->active_ray = 0;
 goto ray_done;
 
 
+
+//reciprocal subroutine. Expands in precision with larger table
+//load in x somehow
+uint32_t neg_max = 0x80000000;
+uint32_t sign = x & neg_max;
+neg_max ^= 0xFFFFFFFF;
+x &= neg_max;
+uint32_t original_magnitude = x;
+
+uint32_t exp = x >> 23;
+uint32_t new_exp = 254 - exp;
+
+uint32_t index = x >> 12;
+index &= 0x7FF;
+index <<= 2;
+uint32_t table_addr = self.div_table_high;
+set_address_bits(table_addr);
+table_addr = self.div_table_low;
+table_addr += index;
+uint32_t reciprocal_lookup = load_dram_word(table_addr);
+
+new_exp <<= 23;
+reciprocal_lookup |= new_exp;
+
+// NR: r1 = r0 * (2 - x * r0)
+float xf = original_magnitude;  // move to float register
+float r0 = reciprocal_lookup;   // move to float register
+float t = xf * r0;              // x * r0
+float two = 2.0f;
+t = two - t;                   // 2 - x*r0
+r0 = r0 * t;                    // r1 = r0 * (2 - x*r0)
+r0 |= sign;
+// r0 is returned
+
+
+/* Stuff left:
+Ray Inflation (picking up new rays when Idle)
+Primary Ray Generation from pixels
+Tile Management
+Final pixel accumulation
+Bounce Ray Division
+Interrupts
+Ray queue management
+*/

@@ -374,6 +374,8 @@ pub enum Operation {
     BranchNe,
     BranchLTE,
     BranchGT,
+    BranchLTEU,
+    BranchGTU,
     Jump,
 
     BlockVal,
@@ -589,6 +591,8 @@ fn decode_instruction(instruction_word: u32, pc: u16) -> DecodedInstruction {
         50 => Operation::Mod,
         51 => Operation::AtomicAdd,
         52 => Operation::GetLowClock,
+        53 => Operation::BranchLTEU,
+        54 => Operation::BranchGTU,
         _ => panic!("UNKNOWN OPERATION"),
     };
     let fp_type = match (instruction_word >> 20) & 0x3 {
@@ -616,7 +620,7 @@ fn decode_instruction(instruction_word: u32, pc: u16) -> DecodedInstruction {
         sr2: sr2_index,
         dr: dr_index,
         branch_hint: imm_1 == 1,
-        imm_0: imm_0,
+        imm_0: imm_0 as u16 as i16 as u32,
         imm_1: imm_1,
         is_imm: imm_1 == 1,
         pc,
@@ -649,7 +653,7 @@ fn num_source_registers(instr: &DecodedInstruction) -> u8 {
         FPAdd | FPMul | FPSub | FPEQ | FPLT | FPMinMax => 2,
         FPMac => 2,
         FPStoreAccumulator | GetLowClock => 0,
-        BranchEq | BranchNe | BranchLTE | BranchGT => 2,
+        BranchEq | BranchNe | BranchLTE | BranchGT | BranchGTU | BranchLTEU => 2,
         BlockVal => 0,
 
         ReadSignedByteDram | ReadUnsignedByteDram | ReadSignedHalfDram | ReadUnsignedHalfDram
@@ -2170,7 +2174,8 @@ impl Core {
                         let address = if instruction_to_execute.imm_1 != 0 {
                             instruction_to_execute.imm_0 as u16
                         } else {
-                            self.register_file[self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr2] as u16
+                            self.register_file[self.context_in_progress * REGS_PER_CONTEXT 
+                                + instruction_to_execute.sr1] as u16 + instruction_to_execute.imm_0 as u16
                         };
                         let value = match instruction_to_execute.operation {
                             Operation::LoadByteSigned =>
@@ -2244,22 +2249,12 @@ impl Core {
                         }
                     }
                     Operation::BranchLTE => {
-                        let is_lt = match instruction_to_execute.imm_1 {
-                            0 => {
-                                self.register_file[self.context_in_progress * REGS_PER_CONTEXT
-                                    + instruction_to_execute.sr1]
-                                    <= self.register_file[self.context_in_progress * REGS_PER_CONTEXT
-                                        + instruction_to_execute.sr2]
-                            }
-                            _ => {
-                                self.register_file[self.context_in_progress * REGS_PER_CONTEXT
-                                    + instruction_to_execute.sr1]
-                                    as i32
-                                    <= self.register_file[self.context_in_progress * REGS_PER_CONTEXT
-                                        + instruction_to_execute.sr2]
-                                        as i32
-                            }
-                        };
+                        let is_lt = self.register_file[self.context_in_progress * REGS_PER_CONTEXT
+                            + instruction_to_execute.sr1]
+                            as i32
+                            <= self.register_file[self.context_in_progress * REGS_PER_CONTEXT
+                                + instruction_to_execute.sr2]
+                                as i32;
                         if is_lt {
                             self.pc[self.context_in_progress] = instruction_to_execute.imm_0 as u16;
                             flush = !instruction_to_execute.branch_hint;
@@ -2269,23 +2264,39 @@ impl Core {
                         }
                     }
                     Operation::BranchGT => {
-                        let is_gt = match instruction_to_execute.imm_1 {
-                            0 => {
-                                self.register_file[self.context_in_progress * REGS_PER_CONTEXT
-                                    + instruction_to_execute.sr1]
-                                    > self.register_file[self.context_in_progress * REGS_PER_CONTEXT
-                                        + instruction_to_execute.sr2]
-                            }
-                            _ => {
-                                self.register_file[self.context_in_progress * REGS_PER_CONTEXT
-                                    + instruction_to_execute.sr1]
-                                    as i32
-                                    > self.register_file[self.context_in_progress * REGS_PER_CONTEXT
-                                        + instruction_to_execute.sr2]
-                                        as i32
-                            }
-                        };
+                        let is_gt = self.register_file[self.context_in_progress * REGS_PER_CONTEXT
+                            + instruction_to_execute.sr1]
+                            as i32
+                            > self.register_file[self.context_in_progress * REGS_PER_CONTEXT
+                                + instruction_to_execute.sr2]
+                                as i32;
                         if is_gt {
+                            self.pc[self.context_in_progress] = instruction_to_execute.imm_0 as u16;
+                            flush = !instruction_to_execute.branch_hint;
+                        } else {
+                            self.pc[self.context_in_progress] += 4;
+                            flush = instruction_to_execute.branch_hint;
+                        }
+                    }
+                    Operation::BranchGTU => {
+                        let is_gt = self.register_file[self.context_in_progress * REGS_PER_CONTEXT
+                            + instruction_to_execute.sr1]
+                            > self.register_file[self.context_in_progress * REGS_PER_CONTEXT
+                                + instruction_to_execute.sr2];
+                        if is_gt {
+                            self.pc[self.context_in_progress] = instruction_to_execute.imm_0 as u16;
+                            flush = !instruction_to_execute.branch_hint;
+                        } else {
+                            self.pc[self.context_in_progress] += 4;
+                            flush = instruction_to_execute.branch_hint;
+                        }
+                    }
+                    Operation::BranchLTEU => {
+                        let is_lt = self.register_file[self.context_in_progress * REGS_PER_CONTEXT
+                            + instruction_to_execute.sr1]
+                            <= self.register_file[self.context_in_progress * REGS_PER_CONTEXT
+                                + instruction_to_execute.sr2];
+                        if is_lt {
                             self.pc[self.context_in_progress] = instruction_to_execute.imm_0 as u16;
                             flush = !instruction_to_execute.branch_hint;
                         } else {
@@ -2437,9 +2448,13 @@ impl Core {
                     }
                     Operation::ReadSignedByteDram => {
                         long_latency_op = true;
-                        let dram_address = self.register_file
-                            [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
-                            as usize
+                        let dram_address = (if instruction_to_execute.imm_1 != 0 {
+                            instruction_to_execute.imm_0 as u16 as usize
+                        } else {
+                            (self.register_file
+                                [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
+                                as u32 + instruction_to_execute.imm_0) as usize
+                        })
                             | (self.memory_bits[self.context_in_progress] as usize) << DRAM_STACK_SIZE_LOG2;
                         if self.top_bits_dram_stack != dram_address / DRAM_STACK_SIZE {
                             self.dram_bytes_read_far += 1;
@@ -2482,9 +2497,13 @@ impl Core {
                     }
                     Operation::ReadUnsignedByteDram => {
                         long_latency_op = true;
-                        let dram_address = self.register_file
-                            [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
-                            as usize
+                        let dram_address = (if instruction_to_execute.imm_1 != 0 {
+                            instruction_to_execute.imm_0 as u16 as usize
+                        } else {
+                            (self.register_file
+                                [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
+                                as u32 + instruction_to_execute.imm_0) as usize
+                        })
                             | (self.memory_bits[self.context_in_progress] as usize) << DRAM_STACK_SIZE_LOG2;
                         if self.top_bits_dram_stack != dram_address / DRAM_STACK_SIZE {
                             self.dram_bytes_read_far += 1;
@@ -2525,9 +2544,13 @@ impl Core {
                     }
                     Operation::ReadSignedHalfDram => {
                         long_latency_op = true;
-                        let dram_address = self.register_file
-                            [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
-                            as usize
+                        let dram_address = (if instruction_to_execute.imm_1 != 0 {
+                            instruction_to_execute.imm_0 as u16 as usize
+                        } else {
+                            (self.register_file
+                                [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
+                                as u32 + instruction_to_execute.imm_0) as usize
+                        })
                             | (self.memory_bits[self.context_in_progress] as usize) << DRAM_STACK_SIZE_LOG2;
                         assert!(
                             dram_address & 0x1 == 0,
@@ -2573,9 +2596,13 @@ impl Core {
                     }
                     Operation::ReadUnsignedHalfDram => {
                         long_latency_op = true;
-                        let dram_address = self.register_file
-                            [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
-                            as usize
+                        let dram_address = (if instruction_to_execute.imm_1 != 0 {
+                            instruction_to_execute.imm_0 as u16 as usize
+                        } else {
+                            (self.register_file
+                                [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
+                                as u32 + instruction_to_execute.imm_0) as usize
+                        })
                             | (self.memory_bits[self.context_in_progress] as usize) << DRAM_STACK_SIZE_LOG2;
                         assert!(
                             dram_address & 0x1 == 0,
@@ -2622,9 +2649,13 @@ impl Core {
                     }
                     Operation::ReadWordDram => {
                         long_latency_op = true;
-                        let dram_address = self.register_file
-                            [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
-                            as usize
+                        let dram_address = (if instruction_to_execute.imm_1 != 0 {
+                            instruction_to_execute.imm_0 as u16 as usize
+                        } else {
+                            (self.register_file
+                                [self.context_in_progress * REGS_PER_CONTEXT + instruction_to_execute.sr1]
+                                as u32 + instruction_to_execute.imm_0) as usize
+                        })
                             | (self.memory_bits[self.context_in_progress] as usize) << DRAM_STACK_SIZE_LOG2;
                         assert!(
                             dram_address & 0x3 == 0,

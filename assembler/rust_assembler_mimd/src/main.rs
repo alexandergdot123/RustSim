@@ -23,7 +23,7 @@ fn opcode_table() -> HashMap<&'static str, u32> {
         ("fpeq", 14), ("fplt", 15),
         ("fpsetacc", 16), ("fpstoreacc", 17), ("fpminmax", 18),
 
-        ("beq", 19), ("bne", 20), ("blte", 21), ("bgt", 22),
+        ("beq", 19), ("bne", 20), ("blte", 21), ("bgt", 22), ("blteu", 53), ("bgtu", 54),
         ("jmp", 23),
 
         ("sb", 24), ("sh", 25), ("sw", 26),
@@ -49,7 +49,7 @@ fn opcode_table() -> HashMap<&'static str, u32> {
 
 fn is_alu(op: u32) -> bool { (0..=9).contains(&op)  || op == 49 || op == 50   }
 fn is_fp(op: u32) -> bool { (10..=18).contains(&op) }
-fn is_branch(op: u32) -> bool { (19..=22).contains(&op) }
+fn is_branch(op: u32) -> bool { (19..=22).contains(&op) || op == 53 || op == 54}
 
 fn parse_reg(s: &str) -> u32 {
     if !s.starts_with('r') {
@@ -84,6 +84,9 @@ fn parse_bool(s: &str) -> bool {
 fn parse_imm_or_label(tok: &str, labels: &HashMap<String, u16>) -> u16 {
     if let Some(hex) = tok.strip_prefix("0x") {
         return u16::from_str_radix(hex, 16).expect("Bad hex immediate");
+    }
+    if let Ok(v) = tok.parse::<i16>() {
+        return v as u16;
     }
     if let Ok(v) = tok.parse::<u32>() {
         if v > 0xFFFF {
@@ -272,43 +275,27 @@ fn assemble_instruction(
     let is_store_d = (45..=47).contains(&opcode);
     // Atomic add DRAM: 48
     let is_atomicadd = opcode == 48 || opcode == 51;
-    if is_load_s {
-        if args.len() != 2 {
-            panic!("{} expects: {} rD, rBASE OR IMM16|label", op_name, op_name);
+    if is_load_s || is_load_d {
+        if args.len() != 2 && args.len() != 3 {
+            panic!("{} expects: {} rD, IMM16|label OR {} rD, rBASE, IMM16|label", op_name, op_name, op_name);
         }
         let rd = parse_reg(args[0]);
-        let (is_imm, base) = if args[1].starts_with('r') {
-            (false, parse_reg(args[1]) as u16)
+        set_dr(&mut instr, rd);
+
+        if args.len() == 3 {
+            // Register-relative: rD, rBASE, offset
+            let base = parse_reg(args[1]) as u16;
+            let offset = parse_imm_or_label(args[2], labels);
+            set_sr1(&mut instr, base as u32);
+            set_imm(&mut instr, offset);
+            set_imm1(&mut instr, 0); // Register-relative mode
         } else {
-            if args[1].starts_with("0x") {
-                (true, parse_imm_or_label(args[1], labels))
-            } else {
-                (true, args[1].parse::<u16>().expect("Bad immediate"))
-            }
-        };
-
-        set_dr(&mut instr, rd);
-        if is_imm{
-            set_imm(&mut instr, base);
-            set_imm1(&mut instr, 1);
+            // Absolute immediate: rD, absolute_ptr
+            let ptr = parse_imm_or_label(args[1], labels);
+            set_imm(&mut instr, ptr);
+            set_imm1(&mut instr, 1); // Absolute immediate mode
         }
-        else {
-            set_sr2(&mut instr, base as u32);
-            set_imm1(&mut instr, 0);
-        }
-        return instr;
-    }
-
-    if is_load_d {
-        if args.len() != 2 {
-            panic!("{} expects: {} rD, rBASE", op_name, op_name);
-        }
-        let rd = parse_reg(args[0]);
-        let base = parse_reg(args[1]);
-
-        set_dr(&mut instr, rd);
-        set_sr1(&mut instr, base);
-        set_imm1(&mut instr, 0);
+        
         return instr;
     }
 
@@ -320,11 +307,7 @@ fn assemble_instruction(
         let (is_imm, base) = if args[1].starts_with('r') {
             (false, parse_reg(args[1]) as u16)
         } else {
-            if args[1].starts_with("0x") {
-                (true, parse_imm_or_label(args[1], labels))
-            } else {
-                (true, args[1].parse::<u16>().expect("Bad immediate"))
-            }
+            (true, parse_imm_or_label(args[1], labels))
         };
         set_sr1(&mut instr, rs);
 
@@ -341,9 +324,9 @@ fn assemble_instruction(
 
     if is_store_d  {
         // format: OP rSRC, rBASE, IMM16|label
-        // encoding: sr1=value, sr2=base, imm0=offset, imm1=1
+        // encoding: sr1=value, sr2=base
         if args.len() != 2 {
-            panic!("{} expects: {} rSRC, rBASE, IMM16|label", op_name, op_name);
+            panic!("{} expects: {} rSRC, rBASE", op_name, op_name);
         }
         let src = parse_reg(args[0]);
         let base = parse_reg(args[1]);
@@ -378,14 +361,17 @@ fn assemble_instruction(
     /* ---------- BRANCH ---------- */
 
     if is_branch(opcode) {
-        // format: OP rS1, rS2, ABS_ADDR|label
+        // format: OP rS1, rS2, ABS_ADDR|label|0xHEX
         // special rule: sr2 stored in dr slot
         if args.len() != 4 {
-            panic!("{} expects: {} rS1, rS2, ABS_ADDR|label", op_name, op_name);
+            panic!("{} expects: {} rS1, rS2, ABS_ADDR|label|0xHEX", op_name, op_name);
         }
         set_sr1(&mut instr, parse_reg(args[0]));
         set_dr(&mut instr, parse_reg(args[1])); // sr2 in dr slot
-        set_imm(&mut instr, parse_imm_or_label(args[2], labels));
+        
+        let addr = parse_imm_or_label(args[2], labels);
+        set_imm(&mut instr, addr);
+        
         set_imm1(&mut instr, parse_bool(args[3]) as u32);
         return instr;
     }

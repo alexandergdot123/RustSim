@@ -376,3 +376,37 @@ void Triangle_Intersect(Triangle* tri, Ray* ray, Vertex* vertices) {
 //need a new_ray interrupt
 //need a "convert to a branch core" interrupt
 //need a "convert to a different leaf core" interrupt
+
+
+//reciprocal subroutine. Expands in precision with larger table
+//load in x somehow
+uint32_t neg_max = 0x80000000;
+uint32_t sign = x & neg_max;
+neg_max ^= 0xFFFFFFFF;
+x &= neg_max;
+uint32_t original_magnitude = x;
+
+uint32_t exp = x >> 23;
+uint32_t new_exp = 254 - exp;
+
+uint32_t index = x >> 12;
+index &= 0x7FF;
+index <<= 2;
+uint32_t table_addr = self.div_table_high;
+set_address_bits(table_addr);
+table_addr = self.div_table_low;
+table_addr += index;
+uint32_t reciprocal_lookup = load_dram_word(table_addr);
+
+new_exp <<= 23;
+reciprocal_lookup |= new_exp;
+
+// NR: r1 = r0 * (2 - x * r0)
+float xf = original_magnitude;  // move to float register
+float r0 = reciprocal_lookup;   // move to float register
+float t = xf * r0;              // x * r0
+float two = 2.0f;
+t = two - t;                   // 2 - x*r0
+r0 = r0 * t;                    // r1 = r0 * (2 - x*r0)
+r0 |= sign;
+// r0 is returned
