@@ -55,6 +55,15 @@ typedef struct { //16924 Bytes
     struct Ray[256] rays; //256 * 64 bytes for the rays
 } ray_queue_dram;
 
+typedef struct { //16924 Bytes
+    uint32_t head_relative; //relative to the start of the queue
+    uint32_t tail_relative; //relative to the start of the queue
+    uint32_t count;
+    struct Ray[32] rays; //32 * 64 bytes for the rays
+} ray_queue_dram;
+
+
+
 typedef struct { //32 Bytes, 8 packets
     float ox, oy, oz;      // 12 bytes - origin
     float dx, dy, dz;      // 12 bytes - direction
@@ -322,43 +331,224 @@ goto start_searching;
 if(ray->active_ray == 1){
     goto start_ray_traversal;
 }
-while(1){
-    yield();
-    int queue_address_low = self.ray_queue_address_low;
-    int queue_address_high = self.ray_queue_address_high;
-    set_address_bits(queue_address_high);
-    int cur_ray_count = load_dram_word(queue_address_low + 8); //check if there are any rays in the queue
-    if(cur_ray_count > 0){
-        int cur_ray_count_check = atomic_add_dram(queue_address_low + 8, -1); //decrement the count of rays in the queue
-        if(cur_ray_count_check == 0){ //if another core took the last ray, we should check again
-            atomic_add_dram(queue_address_low + 8, 1); //undo the decrement
-            goto ray_done;
-        }
-        int head = atomic_add_dram(queue_address_low, 64); // advance head atomically first
-        queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
-        head = head & 0x00003FFF;
-        queue_address_low = queue_address_low + head;
-        //wait_for_write
-        int ready = load_dram_byte(queue_address_low + 63); //the last 4 bytes of the ray slot are used to indicate if the ray is ready to be read
-        if(ready == 0){
-            goto wait_for_write;
-        }
-        int ray_index = ray;
-        for(int i = 0; i < 16; i++){
-            *(ray_index) = load_dram_word(queue_address_low);
-            queue_address_low = queue_address_low + 4;
-            ray_index = ray_index + 4;
-        }
-        write_dram_byte(queue_address_low - 1, 0); //mark the ray as consumed
-        queue_address_low = self.ray_queue_address_low;
-        ray->active_ray = 1; //mark the ray as active
-        goto start_ray_traversal;
-    }
-    yield();
-    yield();
-    yield();
-    yield();
+yield();
+//check local ray queue
+uint32_t local_ray_count = *(self.local_ray_queue + 8);
+if(local_ray_count == 0){
+    goto no_rays_available;
 }
+uint16_t local_ray_queue_head = self.local_ray_queue_head;
+uint32_t slot = atomic_add(local_ray_queue_head, 64);
+local_ray_queue_head += 8;
+atomic_add(local_ray_queue_head, -1);
+slot &= 0x7FF;
+local_ray_queue_head += slot;
+local_ray_queue_head += 4;
+uint32_t ray_val = *(local_ray_queue_head + 0);
+*(ray + 0) = ray_val;
+ray_val = *(local_ray_queue_head + 4);
+*(ray + 4) = ray_val;
+ray_val = *(local_ray_queue_head + 8);
+*(ray + 8) = ray_val;
+ray_val = *(local_ray_queue_head + 12);
+*(ray + 12) = ray_val;
+ray_val = *(local_ray_queue_head + 16);
+*(ray + 16) = ray_val;
+ray_val = *(local_ray_queue_head + 20);
+*(ray + 20) = ray_val;
+ray_val = *(local_ray_queue_head + 24);
+*(ray + 24) = ray_val;
+ray_val = *(local_ray_queue_head + 28);
+*(ray + 28) = ray_val;
+ray_val = *(local_ray_queue_head + 32);
+*(ray + 32) = ray_val;
+ray_val = *(local_ray_queue_head + 36);
+*(ray + 36) = ray_val;
+ray_val = *(local_ray_queue_head + 40);
+*(ray + 40) = ray_val;
+ray_val = *(local_ray_queue_head + 44);
+*(ray + 44) = ray_val;
+ray_val = *(local_ray_queue_head + 48);
+*(ray + 48) = ray_val;
+ray_val = *(local_ray_queue_head + 52);
+*(ray + 52) = ray_val;
+ray_val = *(local_ray_queue_head + 56);
+*(ray + 56) = ray_val;
+ray_val = *(local_ray_queue_head + 60);
+*(ray + 60) = ray_val;
+ray_val &= 0;
+*(local_ray_queue_head + 63) = ray_val;
+goto start_ray_traversal;
+//no_rays_available:
+yield();
+//check dram ray queue
+int queue_address_low = self.ray_queue_address_low;
+int queue_address_high = self.ray_queue_address_high;
+set_address_bits(queue_address_high);
+int cur_ray_count = load_dram_word(queue_address_low + 8); //check if there are any rays in the queue
+if(cur_ray_count > 0){
+    int cur_ray_count_check = atomic_add_dram(queue_address_low + 8, -1); //decrement the count of rays in the queue
+    if(cur_ray_count_check == 0){ //if another core took the last ray, we should check again
+        atomic_add_dram(queue_address_low + 8, 1); //undo the decrement
+        goto ray_done;
+    }
+    int head = atomic_add_dram(queue_address_low, 64); // advance head atomically first
+    queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
+    head = head & 0x00003FFF;
+    queue_address_low = queue_address_low + head;
+    //wait_for_write
+    int ready = load_dram_byte(queue_address_low + 63); //the last 4 bytes of the ray slot are used to indicate if the ray is ready to be read
+    if(ready == 0){
+        goto wait_for_write;
+    }
+    int ray_index = ray;
+    for(int i = 0; i < 16; i++){
+        *(ray_index) = load_dram_word(queue_address_low);
+        queue_address_low = queue_address_low + 4;
+        ray_index = ray_index + 4;
+    }
+    write_dram_byte(queue_address_low - 1, 0); //mark the ray as consumed
+    queue_address_low = self.ray_queue_address_low;
+    ray->active_ray = 1; //mark the ray as active
+    goto start_ray_traversal;
+}
+yield();
+//check spawned_ray_pool
+yield();
+//grab from internal tile, or possibly get new tile
+yield();
+
+//check to see if we're done
+uint32_t finished_ray_high = self.ray_result_addr_high;
+set_address_bits(finished_ray_high);
+uint32_t finished_ray_low = self.ray_result_addr_low;
+uint32_t rays_finished = load_dram_word(finished_ray_low);
+uint32_t max_rays = 1440 * 2560 * 4;
+yield();
+if(rays_finished != max_rays){
+    goto ray_done;
+}
+
+// pixel_color subroutine
+// NUM_BOUNCES is a compile-time constant
+get_thread_ownership();
+set_ctx(15);
+relinquish_ownership();
+yield();
+uint32_t pixel_addr_high = self.ray_result_addr_high;
+set_address_bits(pixel_addr_high);
+uint32_t pixel_addr_low = self.ray_result_addr_low;
+uint32_t pix_index = self.core_id >> 4;
+uint32_t thread_index = self.core_id & 0xF;
+pix_index *= 15;
+pix_index += 15;
+pix_index <<= 8;
+uint32_t pix_increment = pix_index;
+//loop_pixel:
+uint32_t pixel_addr_low = self.ray_result_addr_low;
+pixel_addr_low += pix_increment;
+
+float carried_r = 0.0f;
+float carried_g = 0.0f;
+float carried_b = 0.0f;
+
+uint32_t bounce = NUM_BOUNCES - 1;
+// bounce_loop:
+    uint32_t bounce_addr = bounce;
+    bounce_addr <<= 6;
+    bounce_addr += pixel_addr_low;
+
+    float sr = load_dram_word(bounce_addr);
+    float sg = load_dram_word(bounce_addr + 4);
+    float sb = load_dram_word(bounce_addr + 8);
+    float metallic = load_dram_word(bounce_addr + 12);
+
+    float acc_r = 0.0f;
+    float acc_g = 0.0f;
+    float acc_b = 0.0f;
+
+    uint32_t shadow_addr = bounce_addr + 16;
+    uint32_t light = 0;
+    // shadow_loop:
+        uint32_t len_sq = load_dram_word(shadow_addr + 12);
+        if(len_sq != 0xFFFFFFFF) goto shadow_skip;
+            float lr = load_dram_word(shadow_addr);
+            float lg = load_dram_word(shadow_addr + 4);
+            float lb = load_dram_word(shadow_addr + 8);
+            float atten = reciprocal(len_sq);
+            lr *= atten;
+            lg *= atten;
+            lb *= atten;
+            acc_r += lr;
+            acc_g += lg;
+            acc_b += lb;
+        shadow_skip:
+        shadow_addr += 16;
+        light += 1;
+        if(light < NUM_LIGHTS) goto shadow_loop;
+
+    float diffuse_r = acc_r * sr;
+    float diffuse_g = acc_g * sg;
+    float diffuse_b = acc_b * sb;
+
+    carried_r *= sr;
+    carried_g *= sg;
+    carried_b *= sb;
+
+    float one = 1.0f;
+    float inv_metallic = one - metallic;
+    diffuse_r *= inv_metallic;
+    diffuse_g *= inv_metallic;
+    diffuse_b *= inv_metallic;
+    carried_r *= metallic;
+    carried_g *= metallic;
+    carried_b *= metallic;
+    carried_r += diffuse_r;
+    carried_g += diffuse_g;
+    carried_b += diffuse_b;
+
+    if(bounce == 0) goto bounce_done;
+    bounce -= 1;
+    goto bounce_loop;
+
+// bounce_done:
+// carried_r/g/b is final pixel color
+float one = 1.0f;
+carried_r += one;
+carried_g += one;
+carried_b += one;
+carried_r >>= 14;//using 9 bits to reduce aliasing
+carried_g >>= 14;
+carried_b >>= 14;
+carried_r &= 0x1FF;
+carried_g &= 0x1FF;
+carried_b &= 0x1FF;
+red_byte = *(self.table_mappings + carried_r);
+green_byte = *(self.table_mappings + carried_g);
+blue_byte = *(self.table_mappings + carried_b);
+
+uint32_t pixel_addr_high = self.frame_buffer_high;
+set_address_bits(pixel_addr_high);
+uint32_t pixel_addr_low = self.frame_buffer_low;
+uint32_t pix_offset = pix_increment >> 6; // each pixel is 4 bytes
+pixel_addr_low += pix_offset;
+store_dram_byte(red_byte, pixel_addr_low);
+pixel_addr_low += 1;
+store_dram_byte(green_byte, pixel_addr_low);
+pixel_addr_low += 1;
+store_dram_byte(blue_byte, pixel_addr_low);
+pix_increment += pix_index;
+uint32_t max_rez = 2560 * 1440;
+max_rez <<= 8;
+//need some atomic to increment up till 2560 * 1440;  
+uint32_t finished_pixel_high = self.finished_pixel_high;
+set_address_bits(finished_pixel_high)
+uint32_t finished_pixel_low = self.finished_pixel_low;
+atomic_add_dram(finished_pixel_low, 1);
+if(max_rez > pix_increment){
+    goto loop_pixel;
+}
+
 
 int AABB_Intersect(AABB_Node* node, Ray* ray) {
     float tx1 = (node->x_min - ray->ox) * ray->inv_dx;
@@ -391,8 +581,10 @@ int AABB_Intersect(AABB_Node* node, Ray* ray) {
 
 //complete_ray
 
-uint32_t result_addr_high = self.ray_result_addr_high;
-uint32_t result_addr_low = self.ray_result_addr_low;
+uint32_t finished_ray_high = self.ray_result_addr_high;
+set_address_bits(finished_ray_high);
+uint32_t finished_ray_low = self.ray_result_addr_low;
+atomic_add(finished_ray_low, 1);
 uint32_t pix_index = ray->pix_y;
 pix_index *= 1440;
 pix_index += ray->pix_x;
@@ -717,8 +909,7 @@ r0 |= sign;
 
 /* Stuff left:
 Ray Inflation (picking up new rays when Idle)
-Primary Ray Generation from pixels
-Tile Management
+ Tile Management
 Final pixel accumulation
 Bounce Ray Division
 Interrupts
