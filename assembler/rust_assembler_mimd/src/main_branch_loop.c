@@ -109,7 +109,7 @@ typedef struct {
 // Address: base + (y * 3840 + x) * 256
 // Total: 3840 * 2160 * 256 = ~2.03 GB
 typedef struct {
-    PixelResults pixels[1920 * 1080];  // 2,073,600 pixels
+    PixelResults pixels[2560 * 1440];
 } FrameResults;
 
 // Final pixel color output
@@ -161,11 +161,10 @@ typedef struct {
 
 
 
-const core_ray_forward = 5;
-const branch_trade_rays = 6;
+const ray_ack = 5;
 const reject_ray = 7;
 const wrong_core = 8;
-
+const correct_core = 9;
 
 
 
@@ -185,42 +184,7 @@ if(left_bitfield_check != 0 && right_bitfield_check != 0){
     if(ray->ray_depth == 0){
         //we have completed tracing the ray. now we need to calculate any new spawns
         //say we are creating two additional rays
-        struct RayArray* rayqueue;
-        int head_pos = rayqueue->head;
-        int old_tail = atomic_add(&rayqueue->head, 64);
-        int count = old_tail - head_pos;
-        if(count > 63){
-            atomic_add(&rayqueue->head, -64);
-            goto core_dram_queue;
-        }
-        //ray math goes here, transfering from ray -> old_tail, making sure to mark last byte as 1
-
-        //then complete
-        goto ray_done;
-        //core_dram_queue
-        int queue_address_low = self.stack_ray_pool_address_low;
-        int queue_address_high = self.stack_ray_pool_address_high;
-        set_address_bits(queue_address_high);
-        int cur_ray_count = load_dram_word(queue_address_low + 8); //check if there are any rays in the queue
-        //queue_overfill
-        if(cur_ray_count < 8330000){ //real number is 8338608
-            goto queue_overfill;
-        }
-        int cur_ray_count_check = atomic_add_dram(queue_address_low + 8, 1); //increment the count of rays in the queue
-        int tail = atomic_add_dram(queue_address_low, 64); // advance tail atomically
-        queue_address_low = queue_address_low + 12; //skip the head, tail, and count
-        tail = tail & 0x1FFFFFFF;//wrap tail, can be smaller if potential ray count is smaller
-        queue_address_low = queue_address_low + tail;
-        //wait_for_write
-        int ready = load_dram_byte(queue_address_low + 63); //the last 4 bytes of the ray slot are used to indicate if the ray is ready to be read
-        if(ready == 1){
-            goto wait_for_write;
-        }
-        //do ray calculations, the push onto dram one by one
-        write_dram_byte(queue_address_low - 1, 1); //mark the ray as live
-        goto ray_done;
-
-
+        goto complete_ray;
     }
     uint32_t bitfield = *(ray.check_left + node->is_right * 4);
     uint32_t or_value = 1 << (ray->ray_depth - 1);
@@ -228,7 +192,7 @@ if(left_bitfield_check != 0 && right_bitfield_check != 0){
     *(ray.check_left + node->is_right * 4) = bitfield;
     ray->ray_depth--;
     if(node->parent == 0){
-        goto finish;    
+        goto complete_ray;    
     }
     node = node->parent;
 }
@@ -241,59 +205,105 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
         if(node->tri_count == 0){
             ray->ray_depth++;
             if(node->core_owner != 0xFFFF){
-                //finish
-                ray_send_pending[self.thread_id] = 1;
-                send_packet(self.thread_id, node->core_owner, 48);
-                send_packet(node->node_id, node->core_owner, 48);
-                //forward_branch_ray_loop
-                int got_response = non_blocking_receive(16 + self.thread_id);
-                if(got_response == 1){
-                    int branch_core_response = blocking_receive(16 + self.thread_id);
-                    if(branch_core_response >> 24 == reject_ray || branch_core_response >> 24 == wrong_core){
-                        int queue_address_low = node->queue_low_bit_addr;
-                        int queue_address_high = node->queue_high_bit_addr;
-                        set_address_bits(queue_address_high);
-                        node->core_owner = load_dram_word(queue_address_low + 12);
+                uint16_t ray_send_pending_addr = self.ray_send_pending_addr;
+                atomic_add(ray_send_pending_addr, 1);
+                /*
+                send_ray_to_core(ray, dest):
+                    rays_incoming = 0
+                    send request to dest's interrupt mailbox
+                    sent = false
 
-                        //ensure_space_in_queue:
-                        int cur_ray_count = load_dram_word(queue_address_low + 8);
-                        if(cur_ray_count >= 200){ //if the queue is full, wait until there is space
-                            goto ensure_space_in_queue;
-                        }
+                    loop:
+                        if nb_recv(data_mailbox) >= 1:
+                            for i in 0..16:
+                                blocking_recv(data_mailbox)
+                            enqueue(new_ray) //this enqueue MUST allow for 
+                            rays_incoming--
 
-                        int tail = atomic_add_dram(queue_address_low + 4, 64); //add a ray to the queue
-                        atomic_add_dram(queue_address_low + 8, 1); //increment the count of rays in the queue
-                        tail = tail & 0x00003FFF; //64 bytes, 256 slots in queue
-                        queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
-                        queue_address_low = queue_address_low + tail;
-                        int ray_index = ray;
-                        for(int i = 0; i < 16; i += 1){
-                            store_dram_word(queue_address_low, ray_index);
-                            int queue_address_low = queue_address_low + 4;
-                            ray_index = ray_index + 4;
-                        }
-                        ray_send_pending[self.thread_id] = 0;
-                        atomic_add(&total_rays_traced, 1);
-                        ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
-                        goto ray_done;
+                        if nb_recv(shallow_mailbox) >= 1:
+                            msg = recv(shallow_mailbox)
+                            sent = true
+                            if msg == ACK:
+                                for i in 0..16:
+                                    send(dest, ray[i])
+                            if msg == REJECT:
+                                push to dram queue
+
+                        if nb_recv(interrupt_mailbox) >= 1:
+                            req = recv(interrupt_mailbox)
+                            if space_in_queue - rays_incoming > 0:
+                                send_ack(req.src)
+                                rays_incoming++
+                            else:
+                                send_reject(req.src)
+
+                        if sent and rays_incoming == 0:
+                            break
+
+                        yield
+                */
+
+                uint32_t is_ray_spawned_from_tile = *(self.tile_data_sram->cur_ray_spawned_from_tile + self.thread_id);
+                if(is_ray_spawned_from_tile != 0){
+                    uint32_t depth = ray->ray_depth;
+                    if(depth < 12){
+                        uint32_t tile_sram_address = &(self.tile_data_sram->rays_forwarded_out_from_tile);
+                        atomic_add(tile_sram_address, 1);
                     }
-                    for(int i = 0; i < 16; i++){
-                        send_packet(((uint32_t*)ray)[i], node->core_owner, self.thread_id);
-                    }
-                    if(branch_core_response >> 24 == trade_rays){
-                        for(int i = 0; i < 16; i++){
-                            ((uint32_t*)ray)[i] = blocking_receive(self.thread_id);
-                        }
-                    }
-                    else{
-                        ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
-                    }
-                    ray_send_pending[self.thread_id] = 0;
-                    atomic_add(&total_rays_traced, 1);
-                    goto ray_done;
                 }
-                yield(); // I am going to need to be extremely careful about designing my interrupts
-                goto forward_branch_ray_loop;
+
+
+                // send_packet(self.thread_id, node->core_owner, 48);
+                // send_packet(node->node_id, node->core_owner, 48);
+                // //forward_branch_ray_loop
+                // int got_response = non_blocking_receive(16 + self.thread_id);
+                // if(got_response == 1){
+                //     int branch_core_response = blocking_receive(16 + self.thread_id);
+                //     if(branch_core_response >> 24 == reject_ray || branch_core_response >> 24 == wrong_core){
+                //         int queue_address_low = node->queue_low_bit_addr;
+                //         int queue_address_high = node->queue_high_bit_addr;
+                //         set_address_bits(queue_address_high);
+                //         node->core_owner = load_dram_word(queue_address_low + 12);
+
+                //         //ensure_space_in_queue:
+                //         int cur_ray_count = load_dram_word(queue_address_low + 8);
+                //         if(cur_ray_count >= 200){ //if the queue is full, wait until there is space
+                //             goto ensure_space_in_queue;
+                //         }
+
+                //         int tail = atomic_add_dram(queue_address_low + 4, 64); //add a ray to the queue
+                //         atomic_add_dram(queue_address_low + 8, 1); //increment the count of rays in the queue
+                //         tail = tail & 0x00003FFF; //64 bytes, 256 slots in queue
+                //         queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
+                //         queue_address_low = queue_address_low + tail;
+                //         int ray_index = ray;
+                //         for(int i = 0; i < 16; i += 1){
+                //             store_dram_word(queue_address_low, ray_index);
+                //             int queue_address_low = queue_address_low + 4;
+                //             ray_index = ray_index + 4;
+                //         }
+                //         ray_send_pending[self.thread_id] = 0;
+                //         atomic_add(&total_rays_traced, 1);
+                //         ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
+                //         goto ray_done;
+                //     }
+                //     for(int i = 0; i < 16; i++){
+                //         send_packet(((uint32_t*)ray)[i], node->core_owner, self.thread_id);
+                //     }
+                //     if(branch_core_response >> 24 == trade_rays){
+                //         for(int i = 0; i < 16; i++){
+                //             ((uint32_t*)ray)[i] = blocking_receive(self.thread_id);
+                //         }
+                //     }
+                //     else{
+                //         ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
+                //     }
+                //     ray_send_pending[self.thread_id] = 0;
+                //     atomic_add(&total_rays_traced, 1);
+                //     goto ray_done;
+                // }
+                // yield(); // I am going to need to be extremely careful about designing my interrupts
+                // goto forward_branch_ray_loop;
             }
             else{
                 node = node->left_child; // Traverse left child first
@@ -390,6 +400,7 @@ ray_val = *(local_ray_queue_head + 60);
 *(ray + 60) = ray_val;
 ray_val &= 0;
 *(local_ray_queue_head + 63) = ray_val;
+*(self.tile_data_sram->cur_ray_spawned_from_tile + self.thread_id) = 0;
 goto start_ray_traversal;
 //no_rays_available:
 yield();
@@ -400,7 +411,7 @@ set_address_bits(queue_address_high);
 int cur_ray_count = load_dram_word(queue_address_low + 8); //check if there are any rays in the queue
 if(cur_ray_count > 0){
     int cur_ray_count_check = atomic_add_dram(queue_address_low + 8, -1); //decrement the count of rays in the queue
-    if(cur_ray_count_check == 0){ //if another core took the last ray, we should check again
+    if(cur_ray_count_check <= 0){ //if another core took the last ray, we should check again
         atomic_add_dram(queue_address_low + 8, 1); //undo the decrement
         goto ray_done;
     }
@@ -487,9 +498,10 @@ ray->bounce_count = meta; //treat as word, not half to save space
 
 store_dram_byte(spawned_ray_pool_low + 43, 0); // clear open_slot
 
-yield();
+goto start_ray_traversal;
 
-//PULLING FROM TILES
+
+//grab_from_tile:
 uint16_t is_active = *(self.tile_data_sram->is_active);
 if(!is_active){
     goto get_new_tile;
@@ -584,6 +596,7 @@ uint32_t zero = 0;
 *(self.tile_data_sram->cur_ray_spawned_from_tile + 4) = zero;
 *(self.tile_data_sram->cur_ray_spawned_from_tile + 8) = zero;
 *(self.tile_data_sram->cur_ray_spawned_from_tile + 12) = zero;
+*(self.tile_data_sram->cur_ray_spawned_from_tile + self.thread_id) = 1;
 self.tile_data_sram->rays_forwarded_out_from_tile = zero;
 self.tile_data_sram->rays_spawned_from_tile = zero;
 relinquish_ownership();
@@ -670,9 +683,9 @@ uint8_t one_byte = 1;
 ray->active_ray = one_byte;
 uint32_t no_hit = 0xFFFFFFFF;
 ray->tri_index = no_hit;
+goto start_ray_traversal;
+
 //skip_grabbing_tile_rays
-
-
 yield();
 //check to see if we're done
 uint32_t finished_ray_high = self.ray_result_addr_high;
@@ -843,7 +856,7 @@ set_address_bits(finished_ray_high);
 uint32_t finished_ray_low = self.ray_result_addr_low;
 atomic_add(finished_ray_low, 1);
 uint32_t pix_index = ray->pix_y;
-pix_index *= 1440;
+pix_index *= 2560;
 pix_index += ray->pix_x;
 pix_index <<= 8;
 result_addr_low += pix_index;
@@ -1207,38 +1220,3 @@ Interrupts
 */
 
 
-/*
-send_ray_to_core(ray, dest):
-    rays_incoming = 0
-    send request to dest's interrupt mailbox
-    sent = false
-
-    loop:
-        if nb_recv(data_mailbox) >= 1:
-            for i in 0..16:
-                blocking_recv(data_mailbox)
-            enqueue(new_ray) //this enqueue MUST allow for 
-            rays_incoming--
-
-        if nb_recv(shallow_mailbox) >= 1:
-            msg = recv(shallow_mailbox)
-            sent = true
-            if msg == ACK:
-                for i in 0..16:
-                    send(dest, ray[i])
-            if msg == REJECT:
-                push to dram queue
-
-        if nb_recv(interrupt_mailbox) >= 1:
-            req = recv(interrupt_mailbox)
-            if space_in_queue - rays_incoming > 0: //space in queue MUST use DRAM as well
-                send_ack(req.src)
-                rays_incoming++
-            else:
-                send_reject(req.src)
-
-        if sent and rays_incoming == 0:
-            break
-
-        yield
-*/
