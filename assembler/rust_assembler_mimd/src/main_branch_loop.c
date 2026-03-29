@@ -28,8 +28,8 @@ typedef struct { //64 Bytes, 16 packets
     uint16_t pix_y;
     uint32_t tri_index;     // index of the triangle hit, 0xFFFF_FFFF if no hit
     uint8_t bounce_count;
-    uint8_t ray_depth;    
     uint8_t light_id; //0 for not a shadow, 1, 2, 3 for lights
+    uint8_t ray_depth;    
     uint8_t active_ray;
 } Ray;                    //64 Bytes, 16 packets
 
@@ -60,7 +60,7 @@ typedef struct { //16924 Bytes
     uint32_t tail_relative; //relative to the start of the queue
     uint32_t count;
     struct Ray[32] rays; //32 * 64 bytes for the rays
-} ray_queue_dram;
+} ray_queue_sram;
 
 
 
@@ -123,15 +123,16 @@ typedef struct {
 } Framebuffer;
 
 typedef struct {
-    uint32_t index;
-    uint16_t count;
-    uint16_t is_valid;
+    uint16_t index;
+    uint8_t count;
+    uint8_t is_valid;
 } tile_slot;
 
 typedef struct {
     uint32_t head;
     uint32_t tail;
-    struct tile_slot slots[1 << 15]; // slightly larger than 1920*1080/64 + 1. Also initializes to full.
+    uint32_t count;
+    struct tile_slot slots[1 << 14]; // slightly larger than 1920*1080/64 + 1. Also initializes to full.
 } tile_queue;
 
 typedef struct {
@@ -146,7 +147,18 @@ typedef struct {
 typedef struct {
     uint32_t relative_byte_cnt;
     uint32_t random_vals[65536];
-}
+} random_table;
+
+typedef struct {
+    uint32_t count;
+    uint16_t is_active;
+    uint8_t tile_x_index;
+    uint8_t tile_y_index;
+    uint8_t cur_ray_spawned_from_tile[16];
+    uint32_t rays_spawned_from_tile;
+    uint32_t rays_forwarded_out_from_tile;
+} tile_data_sram;
+
 
 
 const core_ray_forward = 5;
@@ -414,10 +426,254 @@ if(cur_ray_count > 0){
 }
 yield();
 //check spawned_ray_pool
-yield();
-//grab from internal tile, or possibly get new tile
+uint32_t spawned_ray_pool_high = self.spawned_ray_pool_high;
+set_address_bits(spawned_ray_pool_high);
+uint32_t spawned_ray_pool_low = self.spawned_ray_pool_low;
+uint32_t count = load_dram_word(spawned_ray_pool_low + 8);
+if(count <= 0){
+    goto grab_from_tile;
+}
+spawned_ray_pool_low += 8;
+uint32_t old_cnt = atomic_add(spawned_ray_pool_low, -1);
+if (old_cnt <= 0) {
+    atomic_add(spawned_ray_pool_low, 1);
+    goto grab_from_tile;
+}
+spawned_ray_pool_low -= 8;
+uint32_t head = atomic_add(spawned_ray_pool_low, 32);
+uint32_t head_mask = 0x007FFFFF;
+head &= head_mask;
+spawned_ray_pool_low += head;
+
+//ensure_slot_ready:
+uint8_t slot_ready = load_dram_byte(spawned_ray_pool_low + 43);
+if(slot_ready == 0){
+    goto ensure_slot_ready;
+}
+
+uint32_t value_one   = load_dram_word(spawned_ray_pool_low + 12); // ox
+uint32_t value_two   = load_dram_word(spawned_ray_pool_low + 16); // oy
+uint32_t value_three = load_dram_word(spawned_ray_pool_low + 20); // oz
+
+ray->ox = value_one;
+ray->oy = value_two;
+ray->oz = value_three;
+
+uint32_t value_four  = load_dram_word(spawned_ray_pool_low + 24); // dx
+uint32_t value_five  = load_dram_word(spawned_ray_pool_low + 28); // dy
+uint32_t value_six   = load_dram_word(spawned_ray_pool_low + 32); // dz
+
+ray->dx = value_four;
+ray->dy = value_five;
+ray->dz = value_six;
+
+// compute inv_d using your reciprocal subroutine
+ray->inv_dx = reciprocal(ray->dx);
+ray->inv_dy = reciprocal(ray->dy);
+ray->inv_dz = reciprocal(ray->dz);
+
+uint32_t epsilon = 0x38D1B717;
+ray->t_min = epsilon;
+ray->t_max = 0x7F800000; // +inf as raw bits
+
+ray->check_left  = 0;
+ray->check_right = 0;
+
+uint32_t pix_xy      = load_dram_word(spawned_ray_pool_low + 36);
+uint32_t meta        = load_dram_word(spawned_ray_pool_low + 40);
+ray->pix_x = pix_xy; //treat as word, not half to save space
+ray->tri_index = 0xFFFFFFFF;
+ray->bounce_count = meta; //treat as word, not half to save space
+
+store_dram_byte(spawned_ray_pool_low + 43, 0); // clear open_slot
+
 yield();
 
+//PULLING FROM TILES
+uint16_t is_active = *(self.tile_data_sram->is_active);
+if(!is_active){
+    goto get_new_tile;
+}
+uint32_t tile_total_count = *(self.tile_data_sram->count);
+if(tile_total_count > 255){
+    goto skip_returning_tile;
+}
+uint32_t rays_spawned_from_tile = *(self.tile_data_sram->rays_spawned_from_tile);
+if(rays_spawned_from_tile < 7){
+    goto spawn_from_tile;
+}
+uint32_t rays_forwarded_out_from_tile = *(self.tile_data_sram->rays_forwarded_out_from_tile);
+rays_forwarded_out_from_tile <<= 1;
+if(rays_forwarded_out_from_tile < rays_spawned_from_tile){
+    goto spawn_from_tile;
+}
+
+//get_new_tile:
+get_ownership();
+uint32_t tile_pool_high = self.tile_pool_high;
+set_address_bits(tile_pool_high);
+uint32_t tile_pool_low = self.tile_pool_low;
+//NEED TO THROW CURRENT TILE BACK CONDITIONALLY ON THE QUEUE
+uint8_t have_tile = *(self.tile_data_sram->is_active);
+if(have_tile == 0){
+    goto skip_returning_tile;
+}
+uint8_t tile_rays_spawned = *(self.tile_data_sram->count);
+if(tile_rays_spawned > 255){
+    goto skip_returning_tile;
+}
+tile_pool_low += 4;
+uint32_t bytes_relative_tail = atomic_add_dram(tile_pool_low, 4);
+tile_pool_low += 4;
+atomic_add_dram(tile_pool_low, 1);
+bytes_relative_tail &= 0x0000FFFF;
+tile_pool_low += bytes_relative_tail;
+//loop_on_putting_tile_back:
+tile_pool_low += 4;
+uint8_t is_valid = load_dram_byte(tile_pool_low + 3);
+if(is_valid != 0){
+    goto loop_on_putting_tile_back;
+}
+uint32_t tile_y_index = *(self.tile_data_sram->tile_y_index);
+tile_y_index *= 160; // 2560 / 16
+uint32_t tile_x_index = *(self.tile_data_sram->tile_x_index);
+uint16_t tile_index = tile_y_index + tile_x_index;
+store_dram_half(tile_pool_low, tile_index);
+uint8_t tile_rays_spawned = *(self.tile_data_sram->count);
+tile_pool_low += 2;
+store_dram_byte(tile_pool_low, tile_rays_spawned);
+tile_pool_low += 1;
+uint8_t one_small = 1;
+store_dram_byte(tile_pool_low, one_small);
+
+//skip_returning_tile:
+uint32_t tile_pool_low = self.tile_pool_low;
+uint32_t count = load_dram_word(tile_pool_low + 8);
+if(count <= 0){
+    goto skip_grabbing_tile_rays;
+}
+tile_pool_low += 8;
+uint32_t old_cnt = atomic_add(tile_pool_low, -1);
+if (old_cnt <= 0) {
+    atomic_add(tile_pool_low, 1);
+    goto skip_grabbing_tile_rays;
+}
+tile_pool_low -= 8;
+uint32_t head = atomic_add(tile_pool_low, 4);
+uint32_t head_mask = 0x0000FFFF;
+head &= head_mask;
+tile_pool_low += head;
+
+//ensure_tile_slot_ready:
+uint8_t slot_ready = load_dram_byte(tile_pool_low + 15);
+if(slot_ready == 0){
+    goto ensure_tile_slot_ready;
+}
+uint16_t tile_index = load_dram_half(tile_pool_low + 12);
+uint16_t tile_cnt = load_dram_byte(tile_pool_low + 14);
+tile_pool_low += 15;
+store_dram_byte(tile_pool_low, 0);
+self.tile_data_sram->count = tile_cnt;
+uint32_t tile_y_index = tile_index / 160;
+uint32_t tile_x_index = tile_y_index * 160;
+tile_x_index = tile_index - tile_x_index;
+self.tile_data_sram->tile_x_index = tile_x_index;
+self.tile_data_sram->tile_y_index = tile_y_index;
+uint32_t zero = 0;
+*(self.tile_data_sram->cur_ray_spawned_from_tile + 0) = zero;
+*(self.tile_data_sram->cur_ray_spawned_from_tile + 4) = zero;
+*(self.tile_data_sram->cur_ray_spawned_from_tile + 8) = zero;
+*(self.tile_data_sram->cur_ray_spawned_from_tile + 12) = zero;
+self.tile_data_sram->rays_forwarded_out_from_tile = zero;
+self.tile_data_sram->rays_spawned_from_tile = zero;
+relinquish_ownership();
+//spawn_from_tile:
+uint16_t tile_data_sram_address = &(self.tile_data_sram->count);
+uint32_t ray_num_from_tile = atomic_add(tile_data_sram_address, 1);
+if(ray_num_from_tile > 255) {
+    goto get_new_tile;
+}
+tile_data_sram_address += 24;
+atomic_add(tile_data_sram_address, 1);
+uint32_t intra_tile_x = ray_num_from_tile & 0xF;
+uint32_t intra_tile_y = ray_num_from_tile >> 4;
+uint32_t inter_tile_x = *(self.tile_data_sram->tile_x_index);
+uint32_t inter_tile_y = *(self.tile_data_sram->tile_y_index);
+inter_tile_x <<= 4;
+inter_tile_y <<= 4;
+uint32_t pix_x = inter_tile_x + intra_tile_x;
+uint32_t pix_y = inter_tile_y + intra_tile_y;
+
+// === Generate camera ray from (pix_x, pix_y) ===
+ray->pix_x = pix_x;
+ray->pix_y = pix_y;
+
+uint32_t itof_table_high = self.itof_table_high;
+set_address_bits(itof_table_high);
+uint32_t itof_table_low = self.itof_table_low;
+
+uint32_t x_offset = pix_x << 2;
+uint32_t y_offset = pix_y << 2;
+float fpix_x = load_dram_word(itof_table_low + x_offset);
+float fpix_y = load_dram_word(itof_table_low + y_offset);
+
+float cam_cx = *(self.cam_cx);
+float cam_cy = *(self.cam_cy);
+float cam_inv_f = *(self.cam_inv_f);
+
+float dx = fpix_x - cam_cx;
+float dy = fpix_y - cam_cy;
+dx = dx * cam_inv_f;
+dy = dy * cam_inv_f;
+float dz = 0xBF800000; // -1.0f
+
+// Normalize
+float len_sq = dx * dx;
+float tmp = dy * dy;
+len_sq += tmp;
+tmp = dz * dz;
+len_sq += tmp;
+float inv_len = fast_inv_sqrt(len_sq);
+
+dx = dx * inv_len;
+dy = dy * inv_len;
+dz = dz * inv_len;
+
+// Reciprocals
+float inv_dx = reciprocal(dx);
+float inv_dy = reciprocal(dy);
+float inv_dz = reciprocal(dz);
+ray->dx = dx;
+ray->dy = dy;
+ray->dz = dz;
+ray->inv_dx = inv_dx;
+ray->inv_dy = inv_dy;
+ray->inv_dz = inv_dz;
+// === Store ray ===
+float ox = *(self.cam_x);
+float oy = *(self.cam_y);
+float oz = *(self.cam_z);
+ray->ox = ox;
+ray->oy = oy;
+ray->oz = oz;
+
+uint32_t epsilon = 0x38D1B717; // ~1e-5
+ray->t_min = epsilon;
+uint32_t pos_inf = 0x7F800000;
+ray->t_max = pos_inf;
+
+uint32_t zero = 0;
+ray->check_left = zero;
+ray->check_right = zero;
+ray->bounce_count = zero;
+uint8_t one_byte = 1;
+ray->active_ray = one_byte;
+uint32_t no_hit = 0xFFFFFFFF;
+ray->tri_index = no_hit;
+//skip_grabbing_tile_rays
+
+
+yield();
 //check to see if we're done
 uint32_t finished_ray_high = self.ray_result_addr_high;
 set_address_bits(finished_ray_high);
@@ -548,7 +804,8 @@ atomic_add_dram(finished_pixel_low, 1);
 if(max_rez > pix_increment){
     goto loop_pixel;
 }
-
+//inf_loop:
+goto inf_loop;
 
 int AABB_Intersect(AABB_Node* node, Ray* ray) {
     float tx1 = (node->x_min - ray->ox) * ray->inv_dx;
@@ -603,10 +860,6 @@ if(ray->tri_index == 0xFFFFFFFF){
     ray->active_ray = zero;
     goto ray_done
 }
-float old_tmax = ray->t_max;
-float one_minus_epsilon = 0.99999;
-old_tmax *= one_minus_epsilon;
-ray->t_max = old_tmax;
 
 uint32_t tri_addr_high = self.triangle_address_high;
 set_address_bits(tri_addr_high);
@@ -654,8 +907,6 @@ lz = self.lights[2].z - hit_z;
 ndotl = norm_x * lx + norm_y * ly + norm_z * lz;
 ndotl = max(ndotl, 0.0);
 store_dram_word(result_addr_low + 60, ndotl);
-
-
 //need to spawn shadow rays here:
 uint32_t new_ray_pool_high = self.new_ray_pool_high;
 set_address_bits(new_ray_pool_high);
@@ -665,87 +916,65 @@ uint32_t cur_num_new_rays = load_dram_word(new_ray_pool_low + 8);
 if(cur_num_new_rays > 260000){
     goto ensure_space_ray_pool;
 }
-new_ray_pool_low += 4;
-atomic_add_dram(new_ray_pool_low, 96)
-new_ray_pool_low += 4;
-uint32_t tail_slot = atomic_add_dram(new_ray_pool_low, 96);
-new_ray_pool_low += 4;
-new_ray_pool_low += tail_slot;
+new_ray_pool_low += 8;
+atomic_add_dram(new_ray_pool_low, 3)
+new_ray_pool_low -= 4;
+uint32_t tail_slot = atomic_add_dram(new_ray_pool_low, 32);//need to break this into 3 transactions, since it could wrap around
+uint32_t tail_mask = 0x007FFFFF;
+tail_slot &= tail_mask;
+new_ray_pool_low += 8;
 
-//spawn shadow rays
 // hit_x, hit_y, hit_z still in registers
-
-// shadow ray 0 (light 1)
 uint16_t light = self.light_array;
-float sdx = *(light + 12) - hit_x;
-float sdy = *(light + 16) - hit_y;
-float sdz = *(light + 20) - hit_z;
+
+uint32_t light_offsets[3];
+light_offsets[0] = 12;
+light_offsets[1] = 36;
+light_offsets[2] = 60;
+
+uint32_t i = 0;
+//shadow_ray_loop
+uint32_t slot_base = tail_slot;
+slot_base &= tail_mask;
+slot_base += new_ray_pool_low;
+
+float lx = *(light + light_offsets[i]);
+float ly = *(light + light_offsets[i] + 4);
+float lz = *(light + light_offsets[i] + 8);
+float sdx = lx - hit_x;
+float sdy = ly - hit_y;
+float sdz = lz - hit_z;
 
 //ensure_empty
-uint8_t is_empty = load_dram_byte(new_ray_pool_low + 31);
+uint8_t is_empty = load_dram_byte(slot_base + 31);
 if(!is_empty){
     goto ensure_empty;
 }
 uint32_t one = 1;
-store_dram_word(new_ray_pool_low,      hit_x);
-store_dram_word(new_ray_pool_low + 4,  hit_y);
-store_dram_word(new_ray_pool_low + 8,  hit_z);
-store_dram_word(new_ray_pool_low + 12, sdx);
-store_dram_word(new_ray_pool_low + 16, sdy);
-store_dram_word(new_ray_pool_low + 20, sdz);
-uint32_t pix_xy = ray->pix_x;          // pix_x is lower 16, pix_y upper 16
+store_dram_word(slot_base,      hit_x);
+store_dram_word(slot_base + 4,  hit_y);
+store_dram_word(slot_base + 8,  hit_z);
+store_dram_word(slot_base + 12, sdx);
+store_dram_word(slot_base + 16, sdy);
+store_dram_word(slot_base + 20, sdz);
+uint32_t pix_xy = ray->pix_x;
 pix_xy |= (ray->pix_y << 16);
-store_dram_word(new_ray_pool_low + 24, pix_xy);
+store_dram_word(slot_base + 24, pix_xy);
+uint32_t light_id = i + 1;
 uint32_t meta = ray->bounce_count;
-meta |= 1;                      
-store_dram_word(new_ray_pool_low + 28, meta);
-store_dram_byte(new_ray_pool_low + 31, one);
+meta |= light_id;
+store_dram_word(slot_base + 28, meta);
+store_dram_byte(slot_base + 31, one);
 
-
-// shadow ray 1 (light 2)
-//ensure_empty
-uint8_t is_empty = load_dram_byte(new_ray_pool_low + 63);
-if(!is_empty){
-    goto ensure_empty;
+tail_slot += 32;
+tail_slot &= tail_mask;
+i += 1;
+if(i < 3){
+    goto shadow_ray_loop;
 }
-sdx = *(light + 36) - hit_x;
-sdy = *(light + 40) - hit_y;
-sdz = *(light + 44) - hit_z;
-store_dram_word(new_ray_pool_low + 32, hit_x);
-store_dram_word(new_ray_pool_low + 36, hit_y);
-store_dram_word(new_ray_pool_low + 40, hit_z);
-store_dram_word(new_ray_pool_low + 44, sdx);
-store_dram_word(new_ray_pool_low + 48, sdy);
-store_dram_word(new_ray_pool_low + 52, sdz);
-store_dram_word(new_ray_pool_low + 56, pix_xy);
-meta = ray->bounce_count;
-meta |= 2;                      // light_id = 2
-store_dram_word(new_ray_pool_low + 60, meta);
-store_dram_byte(new_ray_pool_low + 63, one);
-
-// shadow ray 2 (light 3)
-//ensure_empty
-uint8_t is_empty = load_dram_byte(new_ray_pool_low + 63);
-if(!is_empty){
-    goto ensure_empty;
-}
-sdx = *(light + 60) - hit_x;
-sdy = *(light + 64) - hit_y;
-sdz = *(light + 68) - hit_z;
-store_dram_word(new_ray_pool_low + 64, hit_x);
-store_dram_word(new_ray_pool_low + 68, hit_y);
-store_dram_word(new_ray_pool_low + 72, hit_z);
-store_dram_word(new_ray_pool_low + 76, sdx);
-store_dram_word(new_ray_pool_low + 80, sdy);
-store_dram_word(new_ray_pool_low + 84, sdz);
-store_dram_word(new_ray_pool_low + 88, pix_xy);
-meta = ray->bounce_count;
-meta |= 3;                      // light_id = 3
-store_dram_word(new_ray_pool_low + 92, meta);
-store_dram_byte(new_ray_pool_low + 95, one);
-ray->active_ray = 0;
 
 if(ray->bounce_count > 2) {
+    ray->active_ray = 0;
     goto ray_done;
 }
 uint32_t random_table_high = self.random_table_addr_high;
@@ -809,22 +1038,61 @@ ray->dz = ray->dz - dot_dn * norm_z;
 random1 *= roughness;
 random2 *= roughness;
 random3 *= roughness;
-ray->dx += random1;
-ray->dy += random2;
-ray->dz += random3;
-float check = ray->dx * norm_x + ray->dy * norm_y + ray->dz * norm_z;
+
+float bdx = ray->dx;
+float bdy = ray->dy;
+float bdz = ray->dz;
+
+bdx += random1;
+bdy += random2;
+bdz += random3;
+
+// normalize before check flip
+float len_sq = bdx * bdx;
+float tmp = bdy * bdy;
+len_sq += tmp;
+tmp = bdz * bdz;
+len_sq += tmp;
+
+float inv_sqrt = fast_inv_sqrt(len_sq);
+
+bdx *= inv_sqrt;
+bdy *= inv_sqrt;
+bdz *= inv_sqrt;
+
+// check flip
+float nx = norm_x;
+float ny = norm_y;
+float nz = norm_z;
+
+float check = bdx * nx;
+tmp = bdy * ny;
+check += tmp;
+tmp = bdz * nz;
+check += tmp;
+
 if (check < 0.0) {
-    check += check;  // 2 * check
-    ray->dx -= check * norm_x;
-    ray->dy -= check * norm_y;
-    ray->dz -= check * norm_z;
+    check += check;
+    tmp = check * nx;
+    bdx -= tmp;
+    tmp = check * ny;
+    bdy -= tmp;
+    tmp = check * nz;
+    bdz -= tmp;
 }
+
+ray->dx = bdx;
+ray->dy = bdy;
+ray->dz = bdz;
+
 float float_max = 0x7F7FFFFF;
 ray->t_max = float_max;
-//still need to do divison for inflation here
-ray->inv_dx = reciprocal(ray->dx);
-ray->inv_dy = reciprocal(ray->dy);
-ray->inv_dz = reciprocal(ray->dz);
+float recip_bdx = reciprocal(bdx);
+ray->inv_dx = recip_bdx;
+float recip_bdy = reciprocal(bdy);
+ray->inv_dy = recip_bdy;
+float recip_bdz = reciprocal(bdz);
+ray->inv_dz = recip_bdz;
 
 goto ray_done;
 
@@ -907,11 +1175,70 @@ r0 |= sign;
 // r0 is returned
 
 
+
+// fast_inv_sqrt:
+// input: len_sq (float, in register)
+// output: half_len_sq (float, 1/sqrt(len_sq))
+
+// extract exponent and top mantissa bits as table index
+uint32_t index = len_sq >> 17;         // top 15 bits of float (1 exp + 14 mantissa)
+uint32_t inv_sqrt_table_high = self.inv_sqrt_table_high;
+set_address_bits(inv_sqrt_table_high);
+uint32_t inv_sqrt_table_low = self.inv_sqrt_table_low;
+index <<= 2;                         // * 4 bytes per entry
+inv_sqrt_table_low += index;
+float est = load_dram_word(inv_sqrt_table_low);  // table gives ~14 bits of precision
+
+// one Newton-Raphson refinement: est = est * (1.5 - 0.5 * len_sq * est * est)
+uint32_t half = 0x3F000000;
+float half_len_sq = len_sq * half;
+uint32_t one_point_five = 0x3FC00000;
+half_len_sq *= est;
+half_len_sq *= est;
+half_len_sq = one_point_five - half_len_sq;
+half_len_sq *= est;
+//resut is half_len_sq
+
+
+
 /* Stuff left:
-Ray Inflation (picking up new rays when Idle)
- Tile Management
-Final pixel accumulation
-Bounce Ray Division
+KEEP TRACK OF WHETHER RAYS ORIGINATED FROM THE CURRENT CORE
 Interrupts
-Ray queue management
+*/
+
+
+/*
+send_ray_to_core(ray, dest):
+    rays_incoming = 0
+    send request to dest's interrupt mailbox
+    sent = false
+
+    loop:
+        if nb_recv(data_mailbox) >= 1:
+            for i in 0..16:
+                blocking_recv(data_mailbox)
+            enqueue(new_ray) //this enqueue MUST allow for 
+            rays_incoming--
+
+        if nb_recv(shallow_mailbox) >= 1:
+            msg = recv(shallow_mailbox)
+            sent = true
+            if msg == ACK:
+                for i in 0..16:
+                    send(dest, ray[i])
+            if msg == REJECT:
+                push to dram queue
+
+        if nb_recv(interrupt_mailbox) >= 1:
+            req = recv(interrupt_mailbox)
+            if space_in_queue - rays_incoming > 0: //space in queue MUST use DRAM as well
+                send_ack(req.src)
+                rays_incoming++
+            else:
+                send_reject(req.src)
+
+        if sent and rays_incoming == 0:
+            break
+
+        yield
 */
