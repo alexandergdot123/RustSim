@@ -447,8 +447,14 @@ if(ray->active_ray == 1){
 }
 yield();
 //check local ray queue
-uint32_t local_ray_count = *(self.local_ray_queue + 8);
+uint32_t odd_thread = self.thread_id & 1;
+uint32_t offset = odd_thread * 1036; //odd threads write to the receiver queue rather than sender queue
+offset += self.local_ray_queue;
+uint32_t local_ray_count = *(offset + 8);
 if(local_ray_count == 0){
+    if(odd_thread != 0){
+        goto ray_done;
+    }
     goto no_rays_available;
 }
 uint16_t local_ray_queue_head = self.local_ray_queue_head;
