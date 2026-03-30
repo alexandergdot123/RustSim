@@ -21,7 +21,8 @@ typedef struct { //64 Bytes, 16 packets
     float ox, oy, oz;      // 12 bytes - origin
     float dx, dy, dz;      // 12 bytes - direction
     float inv_dx, inv_dy, inv_dz; // 12 bytes - precomputed 1/direction
-    float t_min, t_max;    // 8 bytes  - valid interval
+    float t_max;    // 4 bytes  - valid interval
+    uint32_t leaf_node_starting_point;
     uint32_t check_left;   // used for backtracking
     uint32_t check_right;  // used for backtracking
     uint16_t pix_x;
@@ -33,6 +34,10 @@ typedef struct { //64 Bytes, 16 packets
     uint8_t active_ray;
 } Ray;                    //64 Bytes, 16 packets
 
+typedef struct {
+    uint16_t leaf_core_ptrs[128]; //indexed by node_id, gives the starting address of the leaf core's data for that node. 0 if not a leaf or not owned
+    uint16_t root_node_ptr; //the starting address of the root node's data, used for traversal
+} leaf_core_lookup_table;
 
 
 typedef struct {
@@ -59,7 +64,7 @@ typedef struct { //16924 Bytes
     uint32_t head_relative; //relative to the start of the queue
     uint32_t tail_relative; //relative to the start of the queue
     uint32_t count;
-    struct Ray[32] rays; //32 * 64 bytes for the rays
+    struct Ray[16] rays; //16 * 64 bytes for the rays
 } ray_queue_sram;
 
 
@@ -170,12 +175,10 @@ const correct_core = 9;
 
 
 
-//start_ray_traversal
-node = self.root->left_child; // Start with the left child
-//start_searching
+//start_ray_traversal:
 yield();
 if (ray->check_left & 1 != 0 && ray->check_right & 1 != 0){
-    jmp complete_ray;
+    goto complete_ray;
 }
 uint32_t left_bitfield_check = ray->check_left & (1 << ray->ray_depth) | node->left_child == 0;
 uint32_t right_bitfield_check = ray->check_right & (1 << ray->ray_depth) | node->right_child == 0;
@@ -212,14 +215,12 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
                     rays_incoming = 0
                     send request to dest's interrupt mailbox
                     sent = false
-
                     loop:
                         if nb_recv(data_mailbox) >= 1:
                             for i in 0..16:
                                 blocking_recv(data_mailbox)
                             enqueue(new_ray) //this enqueue MUST allow for 
                             rays_incoming--
-
                         if nb_recv(shallow_mailbox) >= 1:
                             msg = recv(shallow_mailbox)
                             sent = true
@@ -228,7 +229,6 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
                                     send(dest, ray[i])
                             if msg == REJECT:
                                 push to dram queue
-
                         if nb_recv(interrupt_mailbox) >= 1:
                             req = recv(interrupt_mailbox)
                             if space_in_queue - rays_incoming > 0:
@@ -236,11 +236,8 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
                                 rays_incoming++
                             else:
                                 send_reject(req.src)
-
                         if sent and rays_incoming == 0:
                             break
-
-                        yield
                 */
 
                 uint32_t is_ray_spawned_from_tile = *(self.tile_data_sram->cur_ray_spawned_from_tile + self.thread_id);
@@ -251,59 +248,154 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
                         atomic_add(tile_sram_address, 1);
                     }
                 }
+                uint32_t slot = 0xFFFFFFFF;
+                uint32_t sent = 0;
+                uint32_t request_word = (node->node_id << 17) | self.thread_id;
+                send_packet(request_word, node->core_owner, INTERRUPT_MAILBOX);
 
+                //send_ray_loop:
+                uint32_t msg_available = nb_recv(self.thread_id + 16);
+                if(msg_available == 1){
+                    uint32_t msg = blocking_receive(self.thread_id + 16);
+                    uint32_t header = msg >> 24;
 
-                // send_packet(self.thread_id, node->core_owner, 48);
-                // send_packet(node->node_id, node->core_owner, 48);
-                // //forward_branch_ray_loop
-                // int got_response = non_blocking_receive(16 + self.thread_id);
-                // if(got_response == 1){
-                //     int branch_core_response = blocking_receive(16 + self.thread_id);
-                //     if(branch_core_response >> 24 == reject_ray || branch_core_response >> 24 == wrong_core){
-                //         int queue_address_low = node->queue_low_bit_addr;
-                //         int queue_address_high = node->queue_high_bit_addr;
-                //         set_address_bits(queue_address_high);
-                //         node->core_owner = load_dram_word(queue_address_low + 12);
+                    if(header == ack_ray){
+                        for(int i = 0; i < 16; i++){
+                            send_packet(((uint32_t*)ray)[i], node->core_owner, msg & 0xF);
+                        }
+                        ray->active_ray = 0;
+                        sent = 1;
+                    }
+                    else{
+                        int queue_address_high = node->queue_high_bit_addr;
+                        set_address_bits(queue_address_high);
 
-                //         //ensure_space_in_queue:
-                //         int cur_ray_count = load_dram_word(queue_address_low + 8);
-                //         if(cur_ray_count >= 200){ //if the queue is full, wait until there is space
-                //             goto ensure_space_in_queue;
-                //         }
+                        // typedef struct { //16924 Bytes
+                        //     uint32_t head_relative; //relative to the start of the queue in DRAM
+                        //     uint32_t tail_relative; //relative to the start of the queue in DRAM
+                        //     uint32_t count;
+                        //     uint32_t next_ticket;//atomically incremented
+                        //     uint32_t now_serving; //spin on when this value equals your ticket, then increment when done
+                        //     uint32_t lock;
+                        //     uint32_t core_owner_count;
+                        //     uint16_t core_slots[256];
+                        //     struct Ray[256] rays; //256 * 64 bytes for the rays
+                        // } ray_queue_dram;
+                        int queue_address_low = node->queue_low_bit_addr;
+                        queue_address_low += 20;
+                        //ensure_no_writers:
+                        int is_there_a_writer = atomic_add_dram(queue_address_low, 1); 
+                        if(is_there_a_writer < 0){
+                            atomic_add_dram(queue_address_low, -1);
+                            goto ensure_no_writers;
+                        }
+                        //ensure_space_in_queue:
+                        int cur_ray_count = load_dram_word(queue_address_low - 12);
+                        if(cur_ray_count > 255){
+                            goto ensure_space_in_queue;
+                        }
+                        int cur_num_cores_serving_queue = load_dram_word(queue_address_low + 4);
+                        if(cur_num_cores_serving_queue > 200){
+                            //need to throw the node_id into a queue for someone to pick up the geometry.
+                            //TODO
+                        }
+                        queue_address_low -= 16;
+                        int tail = atomic_add_dram(queue_address_low, 64);
+                        tail &= 0x00003FFF;
+                        int write_addr = queue_address_low + 536;
+                        write_addr += tail;
+                        //wait_for_slot_to_open:
+                        int cur_ray_count = load_dram_byte(write_addr + 63);
+                        if(cur_ray_count != 0){
+                            goto wait_for_slot_to_open;
+                        }
+                        uint32_t ray_index = ray;
+                        for(int i = 0; i < 16; i++){
+                            uint32_t ray_word = load_word(ray_index);
+                            store_dram_word(write_addr, ray_word);
+                            write_addr = write_addr + 4;
+                            ray_index = ray_index + 4;
+                        }
+                        queue_address_low = node->queue_low_bit_addr;
+                        if(header == wrong_core){
+                            uint32_t core_owner_count = load_dram_word(queue_address_low + 24);
+                            if(core_owner_count == 0){
+                                node->core_owner = 0xFFFFFFFE;
+                            }
+                            else{
+                                uint16_t idx = ((self.core_id >> 7) ^ (self.core_id & 0x7F)) % core_owner_count;
+                                idx <<= 1;
+                                queue_address_low += idx;
+                                uint32_t core_to_cache = load_dram_word(queue_address_low + 28);
+                                node->core_owner = core_to_cache;
+                            }
+                        }
+                        queue_address_low += 20;
+                        atomic_add_dram(queue_address_low, -1);
+                        ray->active_ray = 0;
+                        sent = 1;
+                    }
+                }
+                uint32_t data_available = nb_recv(self.thread_id);
+                if(data_available == 1){
+                    for(int i = 0; i < 16; i++){ 
+                        uint32_t ray_word = blocking_receive(self.thread_id);
+                        *slot = ray_word;
+                        slot = slot + 4;
+                    }
+                    uint16_t leaf_node_index = ray->leaf_node_starting_point;
+                    leaf_node_index <<= 1;
+                    uint32_t leaf_core_data_addr = self.leaf_core_lookup_table->leaf_core_ptrs[leaf_node_index];
+                    *(slot - 16) = leaf_core_data_addr;
+                    slot = 0xFFFFFFFF;
+                }
+                uint32_t is_odd_thread = self.thread_id & 1;
+                uint32_t mailbox_index = is_odd_thread += 32;
+                uint32_t interrupt_available = nb_recv(mailbox_index);
+                if(interrupt_available != 0){
+                    // typedef struct { //16924 Bytes
+                    //     uint32_t head_relative; //relative to the start of the queue
+                    //     uint32_t tail_relative; //relative to the start of the queue
+                    //     uint32_t count;
+                    //     struct Ray[16] rays; //16 * 64 bytes for the rays
+                    // } ray_queue_sram;
+                    //the below should occur on an interrupt which is accepted.
 
-                //         int tail = atomic_add_dram(queue_address_low + 4, 64); //add a ray to the queue
-                //         atomic_add_dram(queue_address_low + 8, 1); //increment the count of rays in the queue
-                //         tail = tail & 0x00003FFF; //64 bytes, 256 slots in queue
-                //         queue_address_low = queue_address_low + 16; //skip the head and count, which are the first 8 bytes of the queue structure
-                //         queue_address_low = queue_address_low + tail;
-                //         int ray_index = ray;
-                //         for(int i = 0; i < 16; i += 1){
-                //             store_dram_word(queue_address_low, ray_index);
-                //             int queue_address_low = queue_address_low + 4;
-                //             ray_index = ray_index + 4;
-                //         }
-                //         ray_send_pending[self.thread_id] = 0;
-                //         atomic_add(&total_rays_traced, 1);
-                //         ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
-                //         goto ray_done;
-                //     }
-                //     for(int i = 0; i < 16; i++){
-                //         send_packet(((uint32_t*)ray)[i], node->core_owner, self.thread_id);
-                //     }
-                //     if(branch_core_response >> 24 == trade_rays){
-                //         for(int i = 0; i < 16; i++){
-                //             ((uint32_t*)ray)[i] = blocking_receive(self.thread_id);
-                //         }
-                //     }
-                //     else{
-                //         ray->active_ray = 0; //the ray has been accepted, so we can mark it as inactive
-                //     }
-                //     ray_send_pending[self.thread_id] = 0;
-                //     atomic_add(&total_rays_traced, 1);
-                //     goto ray_done;
-                // }
-                // yield(); // I am going to need to be extremely careful about designing my interrupts
-                // goto forward_branch_ray_loop;
+                    uint32_t message = blocking_receive(mailbox_index);
+                    uint32_t my_node_id = *self.root_node_id;
+                    uint32_t supposed_node_id = (message >> 17);
+                    if(supposed_node_id != my_node_id){
+                        uint32_t wrong_core_msg = wrong_core << 24;
+                        send_packet(wrong_core_msg, (message >> 4) * 0x1FFF, message & 0xF + 16);
+                        goto done_with_interrupt;
+                    }
+
+                    uint32_t local_queue = self.local_queue + 8; //skip head and tail
+                    is_odd_thread = self.thread_id & 1;
+                    is_odd_thread *= 1036;
+                    local_queue += is_odd_thread; //odd threads write to the receiver queue rather than sender queue
+                    uint32_t old_count = atomic_add(&local_queue.count, 1);
+                    if(old_count > 16){
+                        atomic_add(&local_queue.count, -1);
+                        uint32_t reject_ray_msg = reject_ray << 24;
+                        send_packet(reject_ray_msg, (message >> 4) * 0x1FFF, message & 0xF + 16);
+                        goto done_with_interrupt;
+                    }
+                    local_queue -= 4;
+                    uint32_t tail_relative = atomic_add(&local_queue, 64);
+                    tail_relative = tail_relative & 0x000003FF;
+                    local_queue += 8;
+                    local_queue += tail_relative;
+                    slot = local_queue;
+                    uint32_t ray_ack_msg = ray_ack << 24 | self.thread_id;
+                    send_packet(ray_ack_msg, (message >> 4) * 0x1FFF, message & 0xF + 16);
+                }
+                //done_with_interrupt:
+                if(sent == 1 && slot == 0xFFFFFFFF){
+                    goto ray_done;
+                }
+                goto send_ray_loop;
+                
             }
             else{
                 node = node->left_child; // Traverse left child first
@@ -330,7 +422,7 @@ else if(left_bitfield_check == 0 && right_bitfield_check == 0){
         if(ray->ray_depth == 0){
             ray->check_right = 0xFFFFFFFF;
             ray->check_left = 0xFFFFFFFF;
-            goto start_searching;
+            goto start_ray_traversal;
         }
         uint32_t right_bitfield = *(ray.check_left + node->is_right * 4);
         uint32_t or_value = 1 << (ray->ray_depth - 1);
@@ -348,7 +440,7 @@ else{
     node = *(node.left_child + ((left_bitfield_check != 0) * 2));
     ray->ray_depth++;
 }
-goto start_searching;
+goto start_ray_traversal;
 // ray_done
 if(ray->active_ray == 1){
     goto start_ray_traversal;
@@ -386,7 +478,7 @@ ray_val = *(local_ray_queue_head + 32);
 *(ray + 32) = ray_val;
 ray_val = *(local_ray_queue_head + 36);
 *(ray + 36) = ray_val;
-ray_val = *(local_ray_queue_head + 40);
+ray_val = 128;
 *(ray + 40) = ray_val;
 ray_val = *(local_ray_queue_head + 44);
 *(ray + 44) = ray_val;
@@ -401,6 +493,7 @@ ray_val = *(local_ray_queue_head + 60);
 ray_val &= 0;
 *(local_ray_queue_head + 63) = ray_val;
 *(self.tile_data_sram->cur_ray_spawned_from_tile + self.thread_id) = 0;
+node = ray->leaf_node_starting_point;
 goto start_ray_traversal;
 //no_rays_available:
 yield();
@@ -478,25 +571,40 @@ ray->dx = value_four;
 ray->dy = value_five;
 ray->dz = value_six;
 
-// compute inv_d using your reciprocal subroutine
+uint32_t pix_xy = load_dram_word(spawned_ray_pool_low + 36);
+uint32_t meta   = load_dram_word(spawned_ray_pool_low + 40);
+ray->pix_x = pix_xy;
+ray->bounce_count = meta & 0xFF;
+ray->light_id = (meta >> 8) & 0xFF;
+
+uint32_t is_shadow = ray->light_id;
+float len_sq = ray->dx * ray->dx;
+float tmp = ray->dy * ray->dy;
+len_sq += tmp;
+tmp = ray->dz * ray->dz;
+len_sq += tmp;
+float inv_len = fast_inv_sqrt(len_sq);
+ray->dx = ray->dx * inv_len;
+ray->dy = ray->dy * inv_len;
+ray->dz = ray->dz * inv_len;
 ray->inv_dx = reciprocal(ray->dx);
 ray->inv_dy = reciprocal(ray->dy);
 ray->inv_dz = reciprocal(ray->dz);
-
-uint32_t epsilon = 0x38D1B717;
-ray->t_min = epsilon;
-ray->t_max = 0x7F800000; // +inf as raw bits
+if(is_shadow != 0){
+    ray->t_max = reciprocal(inv_len);
+}
+else{
+    ray->t_max = 0x7F800000;
+}
 
 ray->check_left  = 0;
 ray->check_right = 0;
-
-uint32_t pix_xy      = load_dram_word(spawned_ray_pool_low + 36);
-uint32_t meta        = load_dram_word(spawned_ray_pool_low + 40);
-ray->pix_x = pix_xy; //treat as word, not half to save space
 ray->tri_index = 0xFFFFFFFF;
-ray->bounce_count = meta; //treat as word, not half to save space
+ray->leaf_node_starting_point = 128;
+ray->active_ray = 1;
+ray->ray_depth = 0;
 
-store_dram_byte(spawned_ray_pool_low + 43, 0); // clear open_slot
+store_dram_byte(spawned_ray_pool_low + 43, 0);
 
 goto start_ray_traversal;
 
@@ -671,7 +779,6 @@ ray->oy = oy;
 ray->oz = oz;
 
 uint32_t epsilon = 0x38D1B717; // ~1e-5
-ray->t_min = epsilon;
 uint32_t pos_inf = 0x7F800000;
 ray->t_max = pos_inf;
 
@@ -827,7 +934,6 @@ int AABB_Intersect(AABB_Node* node, Ray* ray) {
     float tmin = min(tx1, tx2);
     float tmax = max(tx1, tx2);
 
-    tmin = max(tmin, ray->t_min);
     tmax = min(tmax, ray->t_max);
 
     if (tmin > tmax || tmax <= 0.0) return 0;
@@ -975,7 +1081,7 @@ pix_xy |= (ray->pix_y << 16);
 store_dram_word(slot_base + 24, pix_xy);
 uint32_t light_id = i + 1;
 uint32_t meta = ray->bounce_count;
-meta |= light_id;
+meta |= light_id << 8;
 store_dram_word(slot_base + 28, meta);
 store_dram_byte(slot_base + 31, one);
 
@@ -1022,8 +1128,8 @@ ray->bounce_count = bounce;
 uint8_t zero = 0;
 ray->ray_depth = zero;
 ray->check_left = zero;
-ray->check_right = zero
-ray->t_min = zero;
+ray->leaf_node_starting_point = 128;
+ray->check_right = zero;
 zero |= 0xFFFFFFFF;
 uint32_t high_triangle = self.triangle_array_high;
 uint32_t low_triangle = self.triangle_array_low;
@@ -1215,7 +1321,6 @@ half_len_sq *= est;
 
 
 /* Stuff left:
-KEEP TRACK OF WHETHER RAYS ORIGINATED FROM THE CURRENT CORE
 Interrupts
 */
 
